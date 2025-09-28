@@ -1,0 +1,77 @@
+{
+  "name": "@terraformer/ts",
+  "version": "1.0.0",
+  "description": "TypeScript implementation of Terraformer - Generate Terraform configurations from existing cloud infrastructure",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "terraformer": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [
+    "terraform",
+    "infrastructure",
+    "iac",
+    "aws",
+    "gcp",
+    "azure",
+    "cloud",
+    "devops",
+    "typescript"
+  ],
+  "author": "Terraformer Team",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/terraformer-ts/terraformer.git"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudfront": "^3.896.0",
+    "@aws-sdk/client-ec2": "^3.898.0",
+    "@aws-sdk/client-iam": "^3.896.0",
+    "@aws-sdk/client-lambda": "^3.896.0",
+    "@aws-sdk/client-rds": "^3.896.0",
+    "@aws-sdk/client-route-53": "^3.896.0",
+    "@aws-sdk/client-s3": "^3.896.0",
+    "@aws-sdk/client-sns": "^3.896.0",
+    "@aws-sdk/client-sqs": "^3.896.0",
+    "@aws-sdk/credential-providers": "^3.450.0",
+    "aws-sdk": "^2.1692.0",
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0",
+    "inquirer": "^8.2.6",
+    "lodash": "^4.17.21",
+    "ora": "^5.4.1",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^8.2.10",
+    "@types/jest": "^29.5.8",
+    "@types/lodash": "^4.14.202",
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.0"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ]
+}
