@@ -1,5 +1,5 @@
 {
-  "name": "@terraformer/ts",
+  "name": "terraformer-ts",
   "version": "1.0.0",
   "description": "TypeScript implementation of Terraformer - Generate Terraform configurations from existing cloud infrastructure",
   "main": "dist/index.js",
@@ -27,11 +27,11 @@
     "devops",
     "typescript"
   ],
-  "author": "Terraformer Team",
+  "author": "Ahmed Reyyan",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/terraformer-ts/terraformer.git"
+    "url": "https://github.com/AhmedReyyan/terraformer-ts.git"
   },
   "engines": {
     "node": ">=16.0.0"
