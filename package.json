@@ -1,6 +1,6 @@
 {
   "name": "terraformer-ts",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "TypeScript implementation of Terraformer - Generate Terraform configurations from existing cloud infrastructure",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
