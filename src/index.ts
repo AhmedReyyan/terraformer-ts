@@ -7,7 +7,7 @@ export { TerraformerLogger, ConsoleLogger } from './core/logger';
 // AWS Provider
 export { AWSProvider } from './providers/aws/aws-provider';
 export * from './providers/aws/services';
-
+//alternative actions
 // Types
 export * from './types';
 
