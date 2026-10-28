@@ -1,34 +1,12 @@
-import { BaseProvider } from '../../core/provider';
-import { BaseService } from '../../core/provider';
-import { 
-  ProviderConfig, 
-  ProviderData, 
-  ResourceConnection, 
-  Logger 
+import { BaseProvider, BaseService } from '../../core/provider';
+import {
+  ProviderConfig,
+  ProviderData,
+  ResourceConnection,
+  Logger
 } from '../../types';
-import { 
-  EC2Service, 
-  S3Service, 
-  IAMService, 
-  RDSService, 
-  LambdaService,
-  CloudFormationService,
-  Route53Service,
-  ElastiCacheService,
-  ELBService,
-  ECSService,
-  EKSService,
-  ElasticsearchService,
-  KinesisService,
-  SNSService,
-  SQSService,
-  DynamoDBService,
-  CloudFrontService,
-  CloudWatchService,
-  CloudWatchLogsService,
-  SecretsManagerService,
-  KMSService
-} from './services';
+import { AWS_SERVICES } from './services';
+import { DEFAULT_REGION } from './aws-service';
 
 export class AWSProvider extends BaseProvider {
   private region: string;
@@ -36,57 +14,41 @@ export class AWSProvider extends BaseProvider {
 
   constructor(config: ProviderConfig, logger: Logger) {
     super('aws', config, logger);
-    this.region = config.region || 'us-east-1';
+    this.region = config.region || DEFAULT_REGION;
     this.profile = config.profile || 'default';
   }
 
+  /** args: [region, profile] */
   async init(args: string[]): Promise<void> {
-    if (args.length > 0) {
+    if (args.length > 0 && args[0]) {
       this.region = args[0];
     }
-    if (args.length > 1) {
+    if (args.length > 1 && args[1]) {
       this.profile = args[1];
     }
-
-    // Set environment variables for AWS SDK
-    if (this.region && this.region !== 'aws-global') {
-      process.env.AWS_REGION = this.region;
-      process.env.AWS_DEFAULT_REGION = this.region;
-    }
-
-    if (this.profile && this.profile !== 'default') {
-      process.env.AWS_PROFILE = this.profile;
-    }
-
     this.config.region = this.region;
     this.config.profile = this.profile;
   }
 
+  getScope(): string {
+    return this.region;
+  }
+
   getSupportedServices(): Record<string, typeof BaseService> {
-    return {
-      'ec2': EC2Service,
-      's3': S3Service,
-      'iam': IAMService,
-      'rds': RDSService,
-      'lambda': LambdaService,
-      'cloudformation': CloudFormationService,
-      'route53': Route53Service,
-      'elasticache': ElastiCacheService,
-      'elb': ELBService,
-      'alb': ELBService, // Application Load Balancer
-      'ecs': ECSService,
-      'eks': EKSService,
-      'elasticsearch': ElasticsearchService,
-      'kinesis': KinesisService,
-      'sns': SNSService,
-      'sqs': SQSService,
-      'dynamodb': DynamoDBService,
-      'cloudfront': CloudFrontService,
-      'cloudwatch': CloudWatchService,
-      'logs': CloudWatchLogsService,
-      'secretsmanager': SecretsManagerService,
-      'kms': KMSService
-    };
+    return AWS_SERVICES;
+  }
+
+  getTerraformEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    const credentials = this.config.credentials;
+    if (credentials?.accessKeyId && credentials.secretAccessKey) {
+      env.AWS_ACCESS_KEY_ID = credentials.accessKeyId;
+      env.AWS_SECRET_ACCESS_KEY = credentials.secretAccessKey;
+      if (credentials.sessionToken) {
+        env.AWS_SESSION_TOKEN = credentials.sessionToken;
+      }
+    }
+    return env;
   }
 
   getResourceConnections(): ResourceConnection {
@@ -178,13 +140,9 @@ export class AWSProvider extends BaseProvider {
   }
 
   getProviderData(): ProviderData {
-    const awsConfig: Record<string, any> = {};
-
-    if (this.region === 'aws-global') {
-      awsConfig.region = 'us-east-1'; // Default region for global services
-    } else if (this.region) {
-      awsConfig.region = this.region;
-    }
+    const awsConfig: Record<string, any> = {
+      region: this.region === 'aws-global' ? DEFAULT_REGION : this.region
+    };
 
     if (this.profile && this.profile !== 'default') {
       awsConfig.profile = this.profile;
@@ -198,7 +156,7 @@ export class AWSProvider extends BaseProvider {
         required_providers: [{
           aws: {
             source: 'hashicorp/aws',
-            version: '~> 5.0'
+            version: '~> 6.0'
           }
         }]
       }
@@ -217,5 +175,3 @@ export class AWSProvider extends BaseProvider {
     return config;
   }
 }
-
-

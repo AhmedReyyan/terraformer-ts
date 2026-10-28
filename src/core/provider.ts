@@ -1,12 +1,13 @@
-import { 
-  TerraformResource, 
-  ImportOptions, 
-  ProviderConfig, 
-  ServiceConfig, 
+import {
+  TerraformResource,
+  ProviderConfig,
   ResourceConnection,
+  ResourceFilter,
   ProviderData,
-  Logger 
+  Logger
 } from '../types';
+import { parseFilter } from './filter';
+import { sanitizeResourceName } from './naming';
 
 export abstract class BaseProvider {
   protected config: ProviderConfig;
@@ -33,10 +34,32 @@ export abstract class BaseProvider {
     return this.config;
   }
 
+  /**
+   * The scope currently being imported (AWS region, GCP project, Azure subscription).
+   * Used for the `{region}` placeholder in path patterns.
+   */
+  getScope(): string {
+    return this.config.region || 'default';
+  }
+
+  /**
+   * Environment variables the terraform CLI needs to authenticate the same way
+   * this provider did (e.g. explicit credentials passed programmatically).
+   */
+  getTerraformEnv(): Record<string, string> {
+    return {};
+  }
+
+  /** Global services are imported only once, even when several regions are requested. */
+  isGlobalService(serviceName: string): boolean {
+    const ServiceClass = this.getSupportedServices()[serviceName] as any;
+    return Boolean(ServiceClass?.global);
+  }
+
   async initService(serviceName: string, verbose: boolean): Promise<BaseService> {
     const supportedServices = this.getSupportedServices();
     const ServiceClass = supportedServices[serviceName];
-    
+
     if (!ServiceClass) {
       throw new Error(`${this.name}: ${serviceName} not supported service`);
     }
@@ -48,11 +71,15 @@ export abstract class BaseProvider {
 }
 
 export abstract class BaseService {
+  /** Set to true on services whose resources are not regional (IAM, Route53, ...). */
+  static readonly global: boolean = false;
+
   protected providerName: string;
   protected serviceName: string;
   protected config: ProviderConfig;
   protected logger: Logger;
   protected resources: TerraformResource[] = [];
+  protected warnings: string[] = [];
   protected verbose: boolean = false;
   protected args: Record<string, any> = {};
 
@@ -64,8 +91,12 @@ export abstract class BaseService {
   }
 
   abstract initResources(): Promise<void>;
-  abstract parseFilter(rawFilter: string): import('../types').ResourceFilter[];
-  abstract postConvertHook(): Promise<void>;
+
+  parseFilter(rawFilter: string): ResourceFilter[] {
+    return parseFilter(rawFilter);
+  }
+
+  async postConvertHook(): Promise<void> {}
 
   getResources(): TerraformResource[] {
     return this.resources;
@@ -77,6 +108,10 @@ export abstract class BaseService {
 
   addResource(resource: TerraformResource): void {
     this.resources.push(resource);
+  }
+
+  getWarnings(): string[] {
+    return this.warnings;
   }
 
   getServiceName(): string {
@@ -103,6 +138,10 @@ export abstract class BaseService {
     return this.providerName;
   }
 
+  /**
+   * Create a resource. `id` must be the import ID documented for `type` in the
+   * Terraform provider. `type` may be given with or without the provider prefix.
+   */
   protected createResource(
     id: string,
     name: string,
@@ -110,22 +149,49 @@ export abstract class BaseService {
     attributes: Record<string, any> = {},
     additionalFields: Record<string, any> = {}
   ): TerraformResource {
+    const fullType = type.startsWith(`${this.providerName}_`) ? type : `${this.providerName}_${type}`;
     return {
       id,
-      type: `${this.providerName}_${type}`,
+      type: fullType,
       name: this.sanitizeName(name),
       provider: this.providerName,
+      service: this.serviceName,
+      region: this.config.region,
       attributes,
       additionalFields
     };
   }
 
+  /** Shorthand for createResource + addResource. */
+  protected add(type: string, id: string, name: string, attributes: Record<string, any> = {}): TerraformResource {
+    const resource = this.createResource(id, name || id, type, attributes);
+    this.addResource(resource);
+    return resource;
+  }
+
+  /**
+   * Run one discovery step. Failures (missing permissions, service not available
+   * in the region, ...) are recorded as warnings so the rest of the service still imports.
+   */
+  protected async collect(label: string, fn: () => Promise<void>): Promise<void> {
+    const before = this.resources.length;
+    try {
+      this.log(`Loading ${label}...`, 'debug');
+      await fn();
+      this.log(`Loaded ${this.resources.length - before} ${label}`, 'debug');
+    } catch (error) {
+      this.warn(`${label}: ${describeError(error)}`);
+    }
+  }
+
+  /** Record a non-fatal problem. Warnings are logged and listed in the import summary. */
+  protected warn(message: string): void {
+    this.warnings.push(`[${this.providerName}:${this.serviceName}] ${message}`);
+    this.log(message, 'warn');
+  }
+
   protected sanitizeName(name: string): string {
-    // Convert to valid Terraform resource name
-    return name
-      .replace(/[^a-zA-Z0-9_-]/g, '_')
-      .replace(/^[0-9]/, '_$&')
-      .toLowerCase();
+    return sanitizeResourceName(name);
   }
 
   protected async sleep(ms: number): Promise<void> {
@@ -137,4 +203,28 @@ export abstract class BaseService {
       this.logger[level](`[${this.providerName}:${this.serviceName}] ${message}`);
     }
   }
+}
+
+export function describeError(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const e = error as { name?: string; code?: string; message?: string };
+    const kind = e.name && e.name !== 'Error' ? e.name : e.code;
+    const message = e.message || String(error);
+    return kind && !message.startsWith(kind) ? `${kind}: ${message}` : message;
+  }
+  return String(error);
+}
+
+/** Map over items with at most `limit` promises in flight. Results keep input order. */
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }

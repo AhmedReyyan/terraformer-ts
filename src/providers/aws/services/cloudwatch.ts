@@ -1,18 +1,39 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
+import { CloudWatchClient, paginateDescribeAlarms, paginateListDashboards } from '@aws-sdk/client-cloudwatch';
+import { AwsService } from '../aws-service';
 
-export class CloudWatchService extends BaseService {
+/** Alarms created by Application Auto Scaling target tracking policies are owned by the scaling policy. */
+const isTargetTrackingAlarm = (name: string): boolean => name.startsWith('TargetTracking-');
+
+export class CloudWatchService extends AwsService {
   async initResources(): Promise<void> {
-    this.log('CloudWatch service not yet implemented', 'warn');
-  }
+    const cloudwatch = this.client(CloudWatchClient);
 
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    return [];
-  }
+    await this.collect('CloudWatch alarms', async () => {
+      for await (const page of paginateDescribeAlarms({ client: cloudwatch }, { AlarmTypes: ['MetricAlarm', 'CompositeAlarm'] })) {
+        for (const alarm of page.MetricAlarms || []) {
+          const name = alarm.AlarmName;
+          if (name && !isTargetTrackingAlarm(name)) {
+            this.add('aws_cloudwatch_metric_alarm', name, name, { name, arn: alarm.AlarmArn });
+          }
+        }
+        for (const alarm of page.CompositeAlarms || []) {
+          const name = alarm.AlarmName;
+          if (name && !isTargetTrackingAlarm(name)) {
+            this.add('aws_cloudwatch_composite_alarm', name, name, { name, arn: alarm.AlarmArn });
+          }
+        }
+      }
+    });
 
-  async postConvertHook(): Promise<void> {
-    this.log('Running CloudWatch post-conversion hook...', 'debug');
+    await this.collect('CloudWatch dashboards', async () => {
+      for await (const page of paginateListDashboards({ client: cloudwatch }, {})) {
+        for (const dashboard of page.DashboardEntries || []) {
+          const name = dashboard.DashboardName;
+          if (name) {
+            this.add('aws_cloudwatch_dashboard', name, name, { name, arn: dashboard.DashboardArn });
+          }
+        }
+      }
+    });
   }
 }
-
-

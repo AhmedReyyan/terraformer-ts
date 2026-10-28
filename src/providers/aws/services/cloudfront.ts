@@ -1,153 +1,189 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
-import { CloudFrontClient, ListDistributionsCommand, ListCachePoliciesCommand } from '@aws-sdk/client-cloudfront';
+import {
+  CloudFrontClient,
+  paginateListDistributions,
+  paginateListCloudFrontOriginAccessIdentities,
+  paginateListOriginAccessControls,
+  paginateListPublicKeys,
+  paginateListKeyValueStores,
+  ListCachePoliciesCommand,
+  ListOriginRequestPoliciesCommand,
+  ListResponseHeadersPoliciesCommand,
+  ListFunctionsCommand,
+  ListKeyGroupsCommand,
+  ListRealtimeLogConfigsCommand,
+  ListVpcOriginsCommand,
+  GetMonitoringSubscriptionCommand
+} from '@aws-sdk/client-cloudfront';
+import { mapLimit } from '../../../core/provider';
+import { AwsService, optional } from '../aws-service';
 
-export class CloudFrontService extends BaseService {
-  private client: CloudFrontClient;
-
-  constructor(providerName: string, serviceName: string, config: ProviderConfig, logger: Logger) {
-    super(providerName, serviceName, config, logger);
-    this.client = new CloudFrontClient({
-      region: config.region || 'us-east-1',
-      credentials: config.credentials ? {
-        accessKeyId: config.credentials.accessKeyId || '',
-        secretAccessKey: config.credentials.secretAccessKey || '',
-        sessionToken: config.credentials.sessionToken || undefined
-      } : undefined
-    });
-  }
-
-  async initResources(): Promise<void> {
-    await this.loadDistributions();
-    await this.loadCachePolicies();
-  }
-
-  private async loadDistributions(): Promise<void> {
-    try {
-      this.log('Loading CloudFront distributions...', 'info');
-      
-      const command = new ListDistributionsCommand({});
-      const response = await this.client.send(command);
-      
-      let distributionCount = 0;
-      for (const distribution of response.DistributionList?.Items || []) {
-        if (distribution.Id) {
-          const resource = this.createResource(
-            distribution.Id,
-            distribution.Id,
-            'cloudfront_distribution',
-            {
-              retain_on_delete: false
-            },
-            {
-              id: distribution.Id,
-              arn: distribution.ARN,
-              domain_name: distribution.DomainName,
-              status: distribution.Status,
-              last_modified_time: distribution.LastModifiedTime
-            }
-          );
-          
-          this.addResource(resource);
-          distributionCount++;
-        }
-      }
-      
-      this.log(`Loaded ${distributionCount} CloudFront distributions`, 'info');
-    } catch (error) {
-      this.log(`Error loading CloudFront distributions: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  private async loadCachePolicies(): Promise<void> {
-    try {
-      this.log('Loading CloudFront cache policies...', 'info');
-      
-      let marker: string | undefined;
-      let cachePolicyCount = 0;
-      
-      do {
-        const command = new ListCachePoliciesCommand({
-          Marker: marker
-        });
-        const response = await this.client.send(command);
-        
-        for (const cachePolicy of response.CachePolicyList?.Items || []) {
-          if (cachePolicy.CachePolicy?.Id) {
-            const resource = this.createResource(
-              cachePolicy.CachePolicy.Id,
-              cachePolicy.CachePolicy.Id,
-              'cloudfront_cache_policy',
-              {},
-              {
-                id: cachePolicy.CachePolicy.Id,
-                name: cachePolicy.CachePolicy.CachePolicyConfig?.Name,
-                comment: cachePolicy.CachePolicy.CachePolicyConfig?.Comment
-              }
-            );
-            
-            this.addResource(resource);
-            cachePolicyCount++;
-          }
-        }
-        
-        marker = response.CachePolicyList?.NextMarker;
-      } while (marker);
-      
-      this.log(`Loaded ${cachePolicyCount} CloudFront cache policies`, 'info');
-    } catch (error) {
-      this.log(`Error loading CloudFront cache policies: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    const filters: ResourceFilter[] = [];
-    
-    if (!rawFilter.includes('Name=') && rawFilter.includes('=')) {
-      const [serviceName, resourcesId] = rawFilter.split('=');
-      filters.push({
-        serviceName,
-        fieldPath: 'id',
-        acceptableValues: resourcesId.split(':'),
-        isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-      });
-    } else {
-      const parts = rawFilter.split(';');
-      if (parts.length >= 1) {
-        const serviceName = parts[0].startsWith('Type=') ? parts[0].substring(5) : '';
-        const fieldPath = parts[1]?.startsWith('Name=') ? parts[1].substring(5) : parts[0];
-        const acceptableValues = parts[2]?.startsWith('Value=') ? 
-          parts[2].substring(6).split(':') : undefined;
-
-        filters.push({
-          serviceName,
-          fieldPath,
-          acceptableValues: acceptableValues || [],
-          isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-        });
-      }
-    }
-
-    return filters;
-  }
-
-  async postConvertHook(): Promise<void> {
-    this.log('Running CloudFront post-conversion hook...', 'debug');
-    
-    // Post-process resources to replace cache policy IDs with references
-    for (const resource of this.resources) {
-      if (resource.type === 'aws_cloudfront_distribution') {
-        // Replace cache policy IDs with references to cache policy resources
-        for (const cachePolicyResource of this.resources) {
-          if (cachePolicyResource.type === 'aws_cloudfront_cache_policy') {
-            // This would need to be implemented based on the actual structure
-            // of the distribution configuration
-          }
-        }
-      }
-    }
-  }
+/** Call a Marker/NextMarker paginated CloudFront list operation until the last page. */
+async function eachPage<T>(fetch: (marker: string | undefined) => Promise<{ items?: T[]; next?: string }>, fn: (item: T) => void): Promise<void> {
+  let marker: string | undefined;
+  do {
+    const page = await fetch(marker);
+    (page.items || []).forEach(fn);
+    marker = page.next || undefined;
+  } while (marker);
 }
 
+export class CloudFrontService extends AwsService {
+  static readonly global = true;
+
+  async initResources(): Promise<void> {
+    // The CloudFront API is only served from us-east-1.
+    const cf = this.client(CloudFrontClient, 'us-east-1');
+    const directDistributions: string[] = [];
+
+    await this.collect('CloudFront distributions', async () => {
+      for await (const page of paginateListDistributions({ client: cf }, {})) {
+        for (const d of page.DistributionList?.Items || []) {
+          const name = d.Aliases?.Items?.[0] || d.Comment || d.Id!;
+          const attributes = { id: d.Id, arn: d.ARN, domain_name: d.DomainName, aliases: d.Aliases?.Items || [] };
+          if (d.ConnectionMode === 'tenant-only') {
+            this.add('aws_cloudfront_multitenant_distribution', d.Id!, name, attributes);
+          } else {
+            directDistributions.push(d.Id!);
+            this.add('aws_cloudfront_distribution', d.Id!, name, attributes);
+          }
+        }
+      }
+    });
+
+    await mapLimit(directDistributions, 5, id =>
+      this.collect(`CloudFront monitoring subscription of ${id}`, async () => {
+        const response = await optional(cf.send(new GetMonitoringSubscriptionCommand({ DistributionId: id })));
+        if (response?.MonitoringSubscription) {
+          this.add('aws_cloudfront_monitoring_subscription', id, `${id}_monitoring`, { distribution_id: id });
+        }
+      })
+    );
+
+    // Only custom policies: AWS managed policies (Type=managed) cannot be managed by Terraform.
+    await this.collect('CloudFront cache policies', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListCachePoliciesCommand({ Type: 'custom', Marker }))).CachePolicyList;
+          return { items: list?.Items, next: list?.NextMarker };
+        },
+        item => {
+          const policy = item.CachePolicy!;
+          const name = policy.CachePolicyConfig?.Name || policy.Id!;
+          this.add('aws_cloudfront_cache_policy', policy.Id!, name, { id: policy.Id, name });
+        }
+      )
+    );
+
+    await this.collect('CloudFront origin request policies', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListOriginRequestPoliciesCommand({ Type: 'custom', Marker }))).OriginRequestPolicyList;
+          return { items: list?.Items, next: list?.NextMarker };
+        },
+        item => {
+          const policy = item.OriginRequestPolicy!;
+          const name = policy.OriginRequestPolicyConfig?.Name || policy.Id!;
+          this.add('aws_cloudfront_origin_request_policy', policy.Id!, name, { id: policy.Id, name });
+        }
+      )
+    );
+
+    await this.collect('CloudFront response headers policies', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListResponseHeadersPoliciesCommand({ Type: 'custom', Marker }))).ResponseHeadersPolicyList;
+          return { items: list?.Items, next: list?.NextMarker };
+        },
+        item => {
+          const policy = item.ResponseHeadersPolicy!;
+          const name = policy.ResponseHeadersPolicyConfig?.Name || policy.Id!;
+          this.add('aws_cloudfront_response_headers_policy', policy.Id!, name, { id: policy.Id, name });
+        }
+      )
+    );
+
+    await this.collect('CloudFront origin access identities', async () => {
+      for await (const page of paginateListCloudFrontOriginAccessIdentities({ client: cf }, {})) {
+        for (const oai of page.CloudFrontOriginAccessIdentityList?.Items || []) {
+          this.add('aws_cloudfront_origin_access_identity', oai.Id!, oai.Comment || oai.Id!, { id: oai.Id, comment: oai.Comment });
+        }
+      }
+    });
+
+    await this.collect('CloudFront origin access controls', async () => {
+      for await (const page of paginateListOriginAccessControls({ client: cf }, {})) {
+        for (const oac of page.OriginAccessControlList?.Items || []) {
+          this.add('aws_cloudfront_origin_access_control', oac.Id!, oac.Name || oac.Id!, { id: oac.Id, name: oac.Name });
+        }
+      }
+    });
+
+    // Every function has a DEVELOPMENT stage (LIVE only once published), so listing that stage
+    // returns each function exactly once. The import ID is the function name.
+    await this.collect('CloudFront functions', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListFunctionsCommand({ Stage: 'DEVELOPMENT', Marker }))).FunctionList;
+          return { items: list?.Items, next: list?.NextMarker };
+        },
+        fn => this.add('aws_cloudfront_function', fn.Name!, fn.Name!, { name: fn.Name, arn: fn.FunctionMetadata?.FunctionARN })
+      )
+    );
+
+    await this.collect('CloudFront key groups', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListKeyGroupsCommand({ Marker }))).KeyGroupList;
+          return { items: list?.Items, next: list?.NextMarker };
+        },
+        item => {
+          const group = item.KeyGroup!;
+          const name = group.KeyGroupConfig?.Name || group.Id!;
+          this.add('aws_cloudfront_key_group', group.Id!, name, { id: group.Id, name });
+        }
+      )
+    );
+
+    await this.collect('CloudFront public keys', async () => {
+      for await (const page of paginateListPublicKeys({ client: cf }, {})) {
+        for (const key of page.PublicKeyList?.Items || []) {
+          this.add('aws_cloudfront_public_key', key.Id!, key.Name || key.Id!, { id: key.Id, name: key.Name });
+        }
+      }
+    });
+
+    await this.collect('CloudFront key value stores', async () => {
+      for await (const page of paginateListKeyValueStores({ client: cf }, {})) {
+        for (const store of page.KeyValueStoreList?.Items || []) {
+          this.add('aws_cloudfront_key_value_store', store.Name!, store.Name!, { id: store.Id, name: store.Name, arn: store.ARN });
+        }
+      }
+    });
+
+    await this.collect('CloudFront real-time log configs', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListRealtimeLogConfigsCommand({ Marker }))).RealtimeLogConfigs;
+          return { items: list?.Items, next: list?.IsTruncated ? list.NextMarker : undefined };
+        },
+        config => this.add('aws_cloudfront_realtime_log_config', config.ARN!, config.Name || config.ARN!, { name: config.Name, arn: config.ARN })
+      )
+    );
+
+    await this.collect('CloudFront VPC origins', () =>
+      eachPage(
+        async Marker => {
+          const list = (await cf.send(new ListVpcOriginsCommand({ Marker }))).VpcOriginList;
+          return { items: list?.Items, next: list?.IsTruncated ? list.NextMarker : undefined };
+        },
+        origin => {
+          // VPC origins being deleted are skipped.
+          if (origin.Status === 'Deleting') {
+            return;
+          }
+          this.add('aws_cloudfront_vpc_origin', origin.Id!, origin.Name || origin.Id!, { id: origin.Id, name: origin.Name, arn: origin.Arn });
+        }
+      )
+    );
+  }
+}

@@ -1,7 +1,23 @@
-import { TerraformResource, ProviderData, HclOutput, ImportOptions } from '../types';
+import { TerraformResource, ProviderData } from '../types';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
+export const PROVIDER_FILE = 'provider';
+export const IMPORTS_FILE = 'imports';
+export const GENERATED_FILE = 'generated.tf';
+export const INVENTORY_FILE = 'inventory.json';
+
+/**
+ * Writes a Terraform root module for a set of discovered resources:
+ *
+ *   provider.tf   - terraform/required_providers and provider configuration
+ *   imports.tf    - one `import` block per resource
+ *   inventory.json - what was discovered, with the metadata used for filtering
+ *
+ * The resource blocks themselves are produced by Terraform
+ * (`terraform plan -generate-config-out=generated.tf`), which reads every
+ * attribute through the real provider so the configuration matches the provider schema.
+ */
 export class HclGenerator {
   private output: 'hcl' | 'json';
   private sort: boolean;
@@ -14,231 +30,196 @@ export class HclGenerator {
   async generateFiles(
     resources: TerraformResource[],
     providerData: ProviderData,
-    outputPath: string,
-    serviceName: string,
-    isCompact: boolean = false
-  ): Promise<void> {
-    await this.ensureDirectory(outputPath);
-
-    // Generate provider configuration
-    await this.generateProviderFile(providerData, outputPath);
-
-    // Generate resource files
-    if (isCompact) {
-      await this.generateCompactResourceFile(resources, outputPath, serviceName);
-    } else {
-      await this.generateSeparateResourceFiles(resources, outputPath, serviceName);
-    }
-  }
-
-  private async ensureDirectory(dirPath: string): Promise<void> {
-    try {
-      await fs.mkdir(dirPath, { recursive: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw error;
-      }
-    }
-  }
-
-  private async generateProviderFile(providerData: ProviderData, outputPath: string): Promise<void> {
-    const fileName = `provider.${this.output === 'hcl' ? 'tf' : 'json'}`;
-    const filePath = path.join(outputPath, fileName);
-    
-    const content = this.output === 'hcl' 
-      ? this.generateHclProvider(providerData)
-      : JSON.stringify(providerData, null, 2);
-
-    await fs.writeFile(filePath, content, 'utf8');
-  }
-
-  private async generateCompactResourceFile(
-    resources: TerraformResource[], 
-    outputPath: string, 
-    serviceName: string
-  ): Promise<void> {
-    const fileName = `resources.${this.output === 'hcl' ? 'tf' : 'json'}`;
-    const filePath = path.join(outputPath, fileName);
-    
-    const content = this.output === 'hcl'
-      ? this.generateHclResources(resources)
-      : JSON.stringify({ resources: this.groupResourcesByType(resources) }, null, 2);
-
-    await fs.writeFile(filePath, content, 'utf8');
-  }
-
-  private async generateSeparateResourceFiles(
-    resources: TerraformResource[], 
-    outputPath: string, 
-    serviceName: string
-  ): Promise<void> {
-    const groupedResources = this.groupResourcesByType(resources);
-    
-    for (const [resourceType, resourceList] of Object.entries(groupedResources)) {
-      const fileName = `${resourceType}.${this.output === 'hcl' ? 'tf' : 'json'}`;
-      const filePath = path.join(outputPath, fileName);
-      
-      const content = this.output === 'hcl'
-        ? this.generateHclResources(resourceList)
-        : JSON.stringify({ resources: { [resourceType]: resourceList } }, null, 2);
-
-      await fs.writeFile(filePath, content, 'utf8');
-    }
-  }
-
-  private generateHclProvider(providerData: ProviderData): string {
-    let hcl = '';
-    
-    // Terraform block
-    if (providerData.terraform) {
-      hcl += 'terraform {\n';
-      if (providerData.terraform.required_providers) {
-        hcl += '  required_providers {\n';
-        for (const provider of providerData.terraform.required_providers) {
-          for (const [name, config] of Object.entries(provider)) {
-            hcl += `    ${name} = {\n`;
-            if (config.source) hcl += `      source = "${config.source}"\n`;
-            if (config.version) hcl += `      version = "${config.version}"\n`;
-            hcl += '    }\n';
-          }
-        }
-        hcl += '  }\n';
-      }
-      hcl += '}\n\n';
-    }
-
-    // Provider blocks
-    for (const [providerName, config] of Object.entries(providerData.provider)) {
-      hcl += `provider "${providerName}" {\n`;
-      for (const [key, value] of Object.entries(config)) {
-        hcl += `  ${key} = ${this.formatHclValue(value)}\n`;
-      }
-      hcl += '}\n\n';
-    }
-
-    return hcl;
-  }
-
-  private generateHclResources(resources: TerraformResource[]): string {
-    let hcl = '';
-    const grouped = this.groupResourcesByType(resources);
-
-    for (const [resourceType, resourceList] of Object.entries(grouped)) {
-      for (const resource of resourceList) {
-        hcl += `resource "${resource.type}" "${resource.name}" {\n`;
-        
-        // Add attributes
-        const allAttributes = { ...resource.attributes, ...resource.additionalFields };
-        for (const [key, value] of Object.entries(allAttributes)) {
-          if (this.shouldIncludeAttribute(key, value, resource)) {
-            hcl += `  ${key} = ${this.formatHclValue(value)}\n`;
-          }
-        }
-        
-        hcl += '}\n\n';
-      }
-    }
-
-    return hcl;
-  }
-
-  private groupResourcesByType(resources: TerraformResource[]): Record<string, TerraformResource[]> {
-    const grouped: Record<string, TerraformResource[]> = {};
-    
-    for (const resource of resources) {
-      const type = resource.type.replace(`${resource.provider}_`, '');
-      if (!grouped[type]) {
-        grouped[type] = [];
-      }
-      grouped[type].push(resource);
-    }
-
-    return grouped;
-  }
-
-  private shouldIncludeAttribute(key: string, value: any, resource: TerraformResource): boolean {
-    // Skip ignored keys
-    if (resource.ignoreKeys?.some(pattern => new RegExp(pattern).test(key))) {
-      return false;
-    }
-
-    // Skip empty values unless allowed
-    if (value === null || value === undefined || value === '') {
-      if (resource.allowEmptyValues?.some(pattern => new RegExp(pattern).test(key))) {
-        return true;
-      }
-      return false;
-    }
-
-    return true;
-  }
-
-  private formatHclValue(value: any): string {
-    if (value === null || value === undefined) {
-      return 'null';
-    }
-    
-    if (typeof value === 'string') {
-      // Escape quotes and handle multiline strings
-      const escaped = value.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-      return `"${escaped}"`;
-    }
-    
-    if (typeof value === 'number' || typeof value === 'boolean') {
-      return String(value);
-    }
-    
-    if (Array.isArray(value)) {
-      const items = value.map(item => this.formatHclValue(item));
-      return `[${items.join(', ')}]`;
-    }
-    
-    if (typeof value === 'object') {
-      const entries = Object.entries(value).map(([k, v]) => `${k} = ${this.formatHclValue(v)}`);
-      return `{\n    ${entries.join(',\n    ')}\n  }`;
-    }
-    
-    return `"${String(value)}"`;
-  }
-
-  async generateTerraformState(
-    resources: TerraformResource[],
     outputPath: string
   ): Promise<void> {
-    const state = {
-      version: 4,
-      terraform_version: '1.0.0',
-      serial: 1,
-      lineage: this.generateLineage(),
-      outputs: {},
-      resources: resources.map(resource => ({
-        mode: 'managed',
-        type: resource.type,
-        name: resource.name,
-        provider: `provider["registry.terraform.io/hashicorp/${resource.provider}"]`,
-        instances: [{
-          schema_version: 0,
-          attributes: resource.attributes,
-          sensitive_attributes: [],
-          private: this.generatePrivateKey(),
-          dependencies: resource.dependencies || []
-        }]
-      }))
-    };
+    await fs.mkdir(outputPath, { recursive: true });
 
-    const statePath = path.join(outputPath, 'terraform.tfstate');
-    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
-  }
+    const ordered = this.sort ? sortResources(resources) : resources;
+    const ext = this.output === 'hcl' ? 'tf' : 'tf.json';
 
-  private generateLineage(): string {
-    // Generate a unique lineage identifier
-    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-  }
+    // Remove files written in the other format so Terraform does not see duplicates.
+    const otherExt = this.output === 'hcl' ? 'tf.json' : 'tf';
+    await removeIfExists(path.join(outputPath, `${PROVIDER_FILE}.${otherExt}`));
+    await removeIfExists(path.join(outputPath, `${IMPORTS_FILE}.${otherExt}`));
 
-  private generatePrivateKey(): string {
-    // Generate a base64 encoded private key
-    return Buffer.from(Math.random().toString(36)).toString('base64');
+    await fs.writeFile(
+      path.join(outputPath, `${PROVIDER_FILE}.${ext}`),
+      this.output === 'hcl' ? renderProviderHcl(providerData) : renderProviderJson(providerData),
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(outputPath, `${IMPORTS_FILE}.${ext}`),
+      this.output === 'hcl' ? renderImportsHcl(ordered) : renderImportsJson(ordered),
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(outputPath, INVENTORY_FILE),
+      JSON.stringify(ordered.map(toInventoryEntry), null, 2) + '\n',
+      'utf8'
+    );
   }
 }
 
+export function sortResources(resources: TerraformResource[]): TerraformResource[] {
+  return [...resources].sort((a, b) =>
+    a.type === b.type ? a.name.localeCompare(b.name) : a.type.localeCompare(b.type)
+  );
+}
 
+export function renderImportsHcl(resources: TerraformResource[]): string {
+  let hcl = '';
+  for (const resource of resources) {
+    hcl += 'import {\n';
+    hcl += `  to = ${resource.type}.${resource.name}\n`;
+    hcl += `  id = ${hclString(resource.id)}\n`;
+    hcl += '}\n\n';
+  }
+  return hcl;
+}
+
+export function renderImportsJson(resources: TerraformResource[]): string {
+  return JSON.stringify({
+    import: resources.map(resource => ({
+      to: `${resource.type}.${resource.name}`,
+      id: escapeTemplate(resource.id)
+    }))
+  }, null, 2) + '\n';
+}
+
+export function renderProviderHcl(providerData: ProviderData): string {
+  let hcl = '';
+
+  if (providerData.terraform?.required_providers) {
+    hcl += 'terraform {\n';
+    hcl += '  required_version = ">= 1.5.0"\n\n';
+    hcl += '  required_providers {\n';
+    for (const provider of providerData.terraform.required_providers) {
+      for (const [name, config] of Object.entries(provider)) {
+        hcl += `    ${name} = {\n`;
+        if (config.source) hcl += `      source  = ${hclString(config.source)}\n`;
+        if (config.version) hcl += `      version = ${hclString(config.version)}\n`;
+        hcl += '    }\n';
+      }
+    }
+    hcl += '  }\n';
+    hcl += '}\n\n';
+  }
+
+  for (const [providerName, config] of Object.entries(providerData.provider)) {
+    hcl += `provider "${providerName}" {\n`;
+    hcl += renderBody(config || {}, 1);
+    hcl += '}\n\n';
+  }
+
+  return hcl;
+}
+
+export function renderProviderJson(providerData: ProviderData): string {
+  const json: Record<string, any> = {};
+  if (providerData.terraform?.required_providers) {
+    const requiredProviders: Record<string, any> = {};
+    for (const provider of providerData.terraform.required_providers) {
+      Object.assign(requiredProviders, provider);
+    }
+    json.terraform = {
+      required_version: '>= 1.5.0',
+      required_providers: requiredProviders
+    };
+  }
+  json.provider = providerData.provider;
+  return JSON.stringify(json, null, 2) + '\n';
+}
+
+/**
+ * Render the body of a block. Nested plain objects become nested blocks and arrays of
+ * objects become repeated blocks, which is how provider configuration is structured
+ * (`features {}`, `assume_role {}`, `default_tags {}`).
+ */
+function renderBody(body: Record<string, any>, depth: number): string {
+  const indent = '  '.repeat(depth);
+  let hcl = '';
+  for (const [key, value] of Object.entries(body)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (isPlainObject(value) && Object.keys(value).length === 0) {
+      hcl += `${indent}${key} {}\n`;
+    } else if (isPlainObject(value)) {
+      hcl += `${indent}${key} {\n${renderBody(value, depth + 1)}${indent}}\n`;
+    } else if (Array.isArray(value) && value.length > 0 && value.every(isPlainObject)) {
+      for (const item of value) {
+        hcl += `${indent}${key} {\n${renderBody(item, depth + 1)}${indent}}\n`;
+      }
+    } else {
+      hcl += `${indent}${key} = ${hclValue(value)}\n`;
+    }
+  }
+  return hcl;
+}
+
+export function hclValue(value: any): string {
+  if (value === null || value === undefined) {
+    return 'null';
+  }
+  if (typeof value === 'string') {
+    return hclString(value);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(hclValue).join(', ')}]`;
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value).map(([k, v]) => `${hclString(k)} = ${hclValue(v)}`);
+    return `{ ${entries.join(', ')} }`;
+  }
+  return hclString(String(value));
+}
+
+/** Quote a string as an HCL string literal, escaping template sequences. */
+export function hclString(value: string): string {
+  let escaped = '';
+  for (const char of escapeTemplate(value)) {
+    switch (char) {
+      case '\\': escaped += '\\\\'; break;
+      case '"': escaped += '\\"'; break;
+      case '\n': escaped += '\\n'; break;
+      case '\r': escaped += '\\r'; break;
+      case '\t': escaped += '\\t'; break;
+      default: {
+        const code = char.codePointAt(0)!;
+        escaped += code < 0x20 || code === 0x7f
+          ? `\\u${code.toString(16).padStart(4, '0')}`
+          : char;
+      }
+    }
+  }
+  return `"${escaped}"`;
+}
+
+/** `${` and `%{` start template sequences in both HCL and JSON syntax strings. */
+function escapeTemplate(value: string): string {
+  // Replacement functions, because "$$" in a replacement string means a literal "$".
+  return value.replace(/\$\{/g, () => '$${').replace(/%\{/g, () => '%%{');
+}
+
+function toInventoryEntry(resource: TerraformResource): Record<string, any> {
+  return {
+    address: `${resource.type}.${resource.name}`,
+    type: resource.type,
+    name: resource.name,
+    id: resource.id,
+    service: resource.service,
+    region: resource.region,
+    attributes: resource.attributes
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function removeIfExists(filePath: string): Promise<void> {
+  await fs.rm(filePath, { force: true });
+}

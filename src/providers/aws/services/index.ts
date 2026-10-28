@@ -1,23 +1,13 @@
-export { EC2Service } from './ec2';
-export { S3Service } from './s3';
-export { IAMService } from './iam';
-export { RDSService } from './rds';
-export { LambdaService } from './lambda';
-export { CloudFormationService } from './cloudformation';
-export { Route53Service } from './route53';
-export { ElastiCacheService } from './elasticache';
-export { ELBService } from './elb';
-export { ECSService } from './ecs';
-export { EKSService } from './eks';
-export { ElasticsearchService } from './elasticsearch';
-export { KinesisService } from './kinesis';
-export { SNSService } from './sns';
-export { SQSService } from './sqs';
-export { DynamoDBService } from './dynamodb';
-export { CloudFrontService } from './cloudfront';
-export { CloudWatchService } from './cloudwatch';
-export { CloudWatchLogsService } from './logs';
-export { SecretsManagerService } from './secretsmanager';
-export { KMSService } from './kms';
+import { BaseService } from '../../../core/provider';
+import { S3Service } from './s3';
+import { IAMService } from './iam';
+import { SQSService } from './sqs';
 
+export { S3Service, IAMService, SQSService };
 
+/** CLI service name -> service implementation. */
+export const AWS_SERVICES: Record<string, typeof BaseService> = {
+  iam: IAMService,
+  s3: S3Service,
+  sqs: SQSService
+};

@@ -1,286 +1,146 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
-import { 
-  Route53Client, 
-  ListHostedZonesCommand, 
+import {
+  Route53Client,
+  paginateListHostedZones,
+  paginateListHealthChecks,
+  paginateListQueryLoggingConfigs,
   ListResourceRecordSetsCommand,
-  ListHealthChecksCommand
+  ListResourceRecordSetsCommandInput,
+  ListReusableDelegationSetsCommand,
+  HostedZone,
+  RRType
 } from '@aws-sdk/client-route-53';
+import { mapLimit } from '../../../core/provider';
+import { AwsService } from '../aws-service';
 
-export class Route53Service extends BaseService {
-  private client: Route53Client;
+const RECORD_TYPES = new Set<string>(Object.values(RRType));
 
-  constructor(providerName: string, serviceName: string, config: ProviderConfig, logger: Logger) {
-    super(providerName, serviceName, config, logger);
-    this.client = new Route53Client({
-      region: config.region || 'us-east-1',
-      credentials: config.credentials ? {
-        accessKeyId: config.credentials.accessKeyId || '',
-        secretAccessKey: config.credentials.secretAccessKey || '',
-        sessionToken: config.credentials.sessionToken || undefined
-      } : undefined
+/** Strip the `/hostedzone/` or `/delegationset/` prefix the API puts on IDs. */
+export function cleanId(id: string): string {
+  return id.replace(/^\/[a-z]+\//, '');
+}
+
+/**
+ * Decode a DNS name as returned by Route 53: octal escapes (`\052` is `*`) are
+ * replaced by their character and the trailing dot is removed.
+ */
+export function decodeRecordName(name: string): string {
+  return name
+    .replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(parseInt(octal, 8)))
+    .replace(/\.$/, '');
+}
+
+export class Route53Service extends AwsService {
+  static readonly global = true;
+
+  private route53!: Route53Client;
+
+  async initResources(): Promise<void> {
+    this.route53 = this.client(Route53Client);
+    const zones: HostedZone[] = [];
+
+    await this.collect('Route53 hosted zones', async () => {
+      for await (const page of paginateListHostedZones({ client: this.route53 }, {})) {
+        for (const zone of page.HostedZones || []) {
+          // Zones created and managed by another service (e.g. Cloud Map namespaces) are skipped.
+          if (zone.LinkedService) {
+            continue;
+          }
+          zones.push(zone);
+          const id = cleanId(zone.Id!);
+          const name = decodeRecordName(zone.Name!);
+          // VPC associations of private zones are imported as the zone's inline `vpc` blocks, so
+          // aws_route53_zone_association is not imported (both together cause a perpetual diff).
+          this.add('aws_route53_zone', id, name, {
+            name,
+            zone_id: id,
+            private_zone: zone.Config?.PrivateZone ?? false
+          });
+        }
+      }
+    });
+
+    await mapLimit(zones, 5, zone =>
+      this.collect(`Route53 records of ${decodeRecordName(zone.Name!)}`, () => this.loadRecords(zone))
+    );
+
+    await this.collect('Route53 health checks', async () => {
+      for await (const page of paginateListHealthChecks({ client: this.route53 }, {})) {
+        for (const check of page.HealthChecks || []) {
+          // Health checks created by another service (e.g. Cloud Map) are managed by that service.
+          if (check.LinkedService) {
+            continue;
+          }
+          const config = check.HealthCheckConfig;
+          const label = config?.FullyQualifiedDomainName || config?.IPAddress || check.Id!;
+          this.add('aws_route53_health_check', check.Id!, `${config?.Type || 'health_check'}_${label}`, {
+            id: check.Id,
+            type: config?.Type,
+            fqdn: config?.FullyQualifiedDomainName
+          });
+        }
+      }
+    });
+
+    await this.collect('Route53 reusable delegation sets', async () => {
+      let Marker: string | undefined;
+      do {
+        const page = await this.route53.send(new ListReusableDelegationSetsCommand({ Marker }));
+        for (const set of page.DelegationSets || []) {
+          const id = cleanId(set.Id!);
+          this.add('aws_route53_delegation_set', id, set.CallerReference || id, { id, reference_name: set.CallerReference });
+        }
+        Marker = page.IsTruncated ? page.NextMarker : undefined;
+      } while (Marker);
+    });
+
+    await this.collect('Route53 query logging configs', async () => {
+      for await (const page of paginateListQueryLoggingConfigs({ client: this.route53 }, {})) {
+        for (const config of page.QueryLoggingConfigs || []) {
+          this.add('aws_route53_query_log', config.Id!, `${config.HostedZoneId}_query_log`, {
+            id: config.Id,
+            zone_id: config.HostedZoneId,
+            cloudwatch_log_group_arn: config.CloudWatchLogsLogGroupArn
+          });
+        }
+      }
     });
   }
 
-  async initResources(): Promise<void> {
-    await this.loadHostedZones();
-    await this.loadHealthChecks();
-  }
+  private async loadRecords(zone: HostedZone): Promise<void> {
+    const zoneId = cleanId(zone.Id!);
+    const zoneName = decodeRecordName(zone.Name!);
+    const input: ListResourceRecordSetsCommandInput = { HostedZoneId: zoneId };
 
-  private async loadHostedZones(): Promise<void> {
-    try {
-      this.log('Loading Route53 hosted zones...', 'info');
-      
-      const command = new ListHostedZonesCommand({});
-      const response = await this.client.send(command);
-      
-      let zoneCount = 0;
-      for (const zone of response.HostedZones || []) {
-        if (zone.Id && zone.Name) {
-          const zoneId = this.cleanZoneId(zone.Id);
-          const zoneName = zone.Name.endsWith('.') ? zone.Name.slice(0, -1) : zone.Name;
-          
-          const resource = this.createResource(
-            zoneId,
-            `${zoneId}_${zoneName}`,
-            'route53_zone',
-            {
-              name: zone.Name,
-              force_destroy: false
-            },
-            {
-              zone_id: zoneId,
-              name_servers: [],
-              comment: zone.Config?.Comment,
-              private_zone: zone.Config?.PrivateZone || false
-            }
-          );
-          
-          this.addResource(resource);
-          zoneCount++;
-          
-          // Load records for this zone
-          await this.loadResourceRecordSets(zoneId);
+    while (true) {
+      const page = await this.route53.send(new ListResourceRecordSetsCommand(input));
+      for (const record of page.ResourceRecordSets || []) {
+        const name = decodeRecordName(record.Name!);
+        const type = record.Type!;
+        // The apex NS and SOA records are created by Route 53 with the zone and belong to it.
+        if ((type === 'NS' || type === 'SOA') && name === zoneName) {
+          continue;
         }
-      }
-      
-      this.log(`Loaded ${zoneCount} Route53 hosted zones`, 'info');
-    } catch (error) {
-      this.log(`Error loading Route53 hosted zones: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  private async loadResourceRecordSets(zoneId: string): Promise<void> {
-    try {
-      this.log(`Loading Route53 records for zone ${zoneId}...`, 'info');
-      
-      let nextRecordName: string | undefined;
-      let nextRecordType: string | undefined;
-      let nextRecordIdentifier: string | undefined;
-      let recordCount = 0;
-      let isTruncated = true;
-      
-      while (isTruncated) {
-        const command = new ListResourceRecordSetsCommand({
-          HostedZoneId: zoneId,
-          StartRecordName: nextRecordName,
-          StartRecordType: nextRecordType as any,
-          StartRecordIdentifier: nextRecordIdentifier
-        });
-        
-        const response = await this.client.send(command);
-        
-        for (const record of response.ResourceRecordSets || []) {
-          if (record.Name && record.Type) {
-            const recordName = this.wildcardUnescape(record.Name);
-            const typeString = record.Type;
-            const setIdentifier = record.SetIdentifier || '';
-            
-            const resource = this.createResource(
-              `${zoneId}_${recordName}_${typeString}_${setIdentifier}`,
-              `${zoneId}_${recordName}_${typeString}_${setIdentifier}`,
-              'route53_record',
-              {
-                name: recordName.endsWith('.') ? recordName.slice(0, -1) : recordName,
-                zone_id: zoneId,
-                type: typeString,
-                set_identifier: setIdentifier
-              },
-              {
-                ttl: record.TTL,
-                records: record.ResourceRecords?.map(rr => rr.Value) || [],
-                alias: record.AliasTarget ? {
-                  name: record.AliasTarget.DNSName,
-                  zone_id: record.AliasTarget.HostedZoneId,
-                  evaluate_target_health: record.AliasTarget.EvaluateTargetHealth
-                } : undefined,
-                health_check_id: record.HealthCheckId,
-                failover: record.Failover,
-                geolocation: record.GeoLocation ? {
-                  continent: record.GeoLocation.ContinentCode,
-                  country: record.GeoLocation.CountryCode,
-                  subdivision: record.GeoLocation.SubdivisionCode
-                } : undefined,
-                latency_routing_policy: record.Region ? [{
-                  region: record.Region
-                }] : undefined,
-                weighted_routing_policy: record.Weight ? [{
-                  weight: record.Weight
-                }] : undefined,
-                multivalue_answer_routing_policy: record.MultiValueAnswer || false
-              }
-            );
-            
-            this.addResource(resource);
-            recordCount++;
-          }
+        const setIdentifier = record.SetIdentifier;
+        // The provider splits the import ID on `_`: a set identifier containing `_` or equal to a
+        // record type cannot be parsed back, so such records cannot be imported.
+        if (setIdentifier && (setIdentifier.includes('_') || RECORD_TYPES.has(setIdentifier))) {
+          this.warn(`record ${name} ${type} in zone ${zoneId}: set identifier "${setIdentifier}" cannot be expressed in an import ID; skipped`);
+          continue;
         }
-        
-        nextRecordName = response.NextRecordName;
-        nextRecordType = response.NextRecordType;
-        nextRecordIdentifier = response.NextRecordIdentifier;
-        isTruncated = response.IsTruncated || false;
-      }
-      
-      this.log(`Loaded ${recordCount} Route53 records for zone ${zoneId}`, 'info');
-    } catch (error) {
-      this.log(`Error loading Route53 records for zone ${zoneId}: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  private async loadHealthChecks(): Promise<void> {
-    try {
-      this.log('Loading Route53 health checks...', 'info');
-      
-      const command = new ListHealthChecksCommand({});
-      const response = await this.client.send(command);
-      
-      let healthCheckCount = 0;
-      for (const healthCheck of response.HealthChecks || []) {
-        if (healthCheck.Id) {
-          const healthCheckStringType = healthCheck.HealthCheckConfig?.Type || 'UNKNOWN';
-          
-          const resource = this.createResource(
-            healthCheck.Id,
-            `${healthCheck.Id}_${healthCheckStringType}`,
-            'route53_health_check',
-            {},
-            {
-              type: healthCheckStringType,
-              resource_path: healthCheck.HealthCheckConfig?.ResourcePath,
-              fqdn: healthCheck.HealthCheckConfig?.FullyQualifiedDomainName,
-              port: healthCheck.HealthCheckConfig?.Port,
-              measure_latency: healthCheck.HealthCheckConfig?.MeasureLatency,
-              request_interval: healthCheck.HealthCheckConfig?.RequestInterval,
-              failure_threshold: healthCheck.HealthCheckConfig?.FailureThreshold,
-              search_string: healthCheck.HealthCheckConfig?.SearchString,
-              invert_healthcheck: healthCheck.HealthCheckConfig?.Inverted,
-              disabled: healthCheck.HealthCheckConfig?.Disabled,
-              enable_sni: healthCheck.HealthCheckConfig?.EnableSNI,
-              insufficient_data_health_status: healthCheck.HealthCheckConfig?.InsufficientDataHealthStatus,
-              regions: healthCheck.HealthCheckConfig?.Regions || [],
-              child_health_threshold: healthCheck.HealthCheckConfig?.ChildHealthChecks?.length,
-              child_healthchecks: healthCheck.HealthCheckConfig?.ChildHealthChecks || [],
-              cloudwatch_alarm_name: undefined,
-              cloudwatch_alarm_region: undefined,
-              cloudwatch_alarm_comparison_operator: healthCheck.CloudWatchAlarmConfiguration?.ComparisonOperator,
-              cloudwatch_alarm_evaluation_periods: healthCheck.CloudWatchAlarmConfiguration?.EvaluationPeriods,
-              cloudwatch_alarm_metric_name: healthCheck.CloudWatchAlarmConfiguration?.MetricName,
-              cloudwatch_alarm_namespace: healthCheck.CloudWatchAlarmConfiguration?.Namespace,
-              cloudwatch_alarm_period: healthCheck.CloudWatchAlarmConfiguration?.Period,
-              cloudwatch_alarm_statistic: healthCheck.CloudWatchAlarmConfiguration?.Statistic,
-              cloudwatch_alarm_threshold: healthCheck.CloudWatchAlarmConfiguration?.Threshold,
-              cloudwatch_alarm_dimensions: healthCheck.CloudWatchAlarmConfiguration?.Dimensions || []
-            }
-          );
-          
-          this.addResource(resource);
-          healthCheckCount++;
-        }
-      }
-      
-      this.log(`Loaded ${healthCheckCount} Route53 health checks`, 'info');
-    } catch (error) {
-      this.log(`Error loading Route53 health checks: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    const filters: ResourceFilter[] = [];
-    
-    if (!rawFilter.includes('Name=') && rawFilter.includes('=')) {
-      const [serviceName, resourcesId] = rawFilter.split('=');
-      filters.push({
-        serviceName,
-        fieldPath: 'id',
-        acceptableValues: resourcesId.split(':'),
-        isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-      });
-    } else {
-      const parts = rawFilter.split(';');
-      if (parts.length >= 1) {
-        const serviceName = parts[0].startsWith('Type=') ? parts[0].substring(5) : '';
-        const fieldPath = parts[1]?.startsWith('Name=') ? parts[1].substring(5) : parts[0];
-        const acceptableValues = parts[2]?.startsWith('Value=') ? 
-          parts[2].substring(6).split(':') : undefined;
-
-        filters.push({
-          serviceName,
-          fieldPath,
-          acceptableValues: acceptableValues || [],
-          isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
+        const importId = `${zoneId}_${name}_${type}${setIdentifier ? `_${setIdentifier}` : ''}`;
+        this.add('aws_route53_record', importId, `${name}_${type}${setIdentifier ? `_${setIdentifier}` : ''}`, {
+          zone_id: zoneId,
+          name,
+          type,
+          set_identifier: setIdentifier
         });
       }
-    }
-
-    return filters;
-  }
-
-  async postConvertHook(): Promise<void> {
-    this.log('Running Route53 post-conversion hook...', 'debug');
-    
-    // Post-process resources to replace zone IDs with references
-    for (const resource of this.resources) {
-      if (resource.type === 'aws_route53_record') {
-        const zoneId = resource.attributes.zone_id;
-        
-        // Find the corresponding zone resource and replace with reference
-        for (const zoneResource of this.resources) {
-          if (zoneResource.type === 'aws_route53_zone' && zoneResource.additionalFields?.zone_id === zoneId) {
-            resource.attributes.zone_id = `\${aws_route53_zone.${zoneResource.name}.zone_id}`;
-            break;
-          }
-        }
-        
-        // Remove TTL if alias is present
-        if (resource.additionalFields?.alias) {
-          delete resource.attributes.ttl;
-        }
+      if (!page.IsTruncated) {
+        break;
       }
-      
-      if (resource.type === 'aws_route53_health_check') {
-        // Remove child_health_threshold if no child health checks
-        if (!resource.additionalFields?.child_healthchecks || resource.additionalFields.child_healthchecks.length === 0) {
-          if (resource.additionalFields?.child_health_threshold) {
-            delete resource.attributes.child_health_threshold;
-          }
-        }
-      }
+      input.StartRecordName = page.NextRecordName;
+      input.StartRecordType = page.NextRecordType;
+      input.StartRecordIdentifier = page.NextRecordIdentifier;
     }
-  }
-
-  private wildcardUnescape(s: string): string {
-    if (s.includes('\\052')) {
-      return s.replace('\\052', '*');
-    }
-    return s;
-  }
-
-  private cleanZoneId(id: string): string {
-    return id.replace('/hostedzone/', '');
   }
 }
-

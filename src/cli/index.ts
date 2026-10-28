@@ -4,116 +4,213 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
-import { AWSProvider } from '../providers/aws/aws-provider';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Terraformer } from '../core/terraformer';
 import { ConsoleLogger } from '../core/logger';
-import { ImportOptions, ProviderConfig } from '../types';
+import { ImportOptions, ImportResult, ProviderConfig } from '../types';
+import { createProvider, resolveProviderName, SUPPORTED_PROVIDERS, ProviderName } from '../providers';
 
 const program = new Command();
 
 program
   .name('terraformer')
   .description('Generate Terraform configurations from existing cloud infrastructure')
-  .version('1.0.0');
+  .version(readVersion());
 
-// AWS Provider Command
-program
-  .command('aws')
-  .description('Import AWS resources')
-  .option('-r, --resources <resources>', 'Comma-separated list of resources to import', 'ec2,s3')
-  .option('-x, --excludes <excludes>', 'Comma-separated list of resources to exclude')
-  .option('-o, --output <path>', 'Output directory', 'generated')
-  .option('-p, --path-pattern <pattern>', 'Path pattern for output files', '{output}/{provider}/{service}/')
-  .option('--region <region>', 'AWS region', 'us-east-1')
-  .option('--profile <profile>', 'AWS profile', 'default')
-  .option('-f, --filters <filters>', 'Comma-separated list of filters')
-  .option('--compact', 'Generate compact output files')
-  .option('--json', 'Generate JSON output instead of HCL')
-  .option('-v, --verbose', 'Verbose output')
-  .option('--no-sort', 'Don\'t sort resources')
-  .action(async (options) => {
-    try {
-      const logger = new ConsoleLogger(options.verbose);
-      const config: ProviderConfig = {
-        region: options.region,
-        profile: options.profile
-      };
+interface CliOptions {
+  resources: string;
+  excludes?: string;
+  output: string;
+  pathPattern?: string;
+  region?: string;
+  profile?: string;
+  subscription?: string;
+  resourceGroup?: string;
+  projects?: string;
+  filter: string[];
+  filters?: string;
+  compact?: boolean;
+  json?: boolean;
+  verbose?: boolean;
+  sort: boolean;
+  generate: boolean;
+  terraformBin?: string;
+}
 
-      const provider = new AWSProvider(config, logger);
-      const terraformer = new Terraformer(provider, logger);
+function collect(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
 
-      const importOptions: ImportOptions = {
-        resources: options.resources.split(','),
-        excludes: options.excludes?.split(','),
-        pathOutput: options.output,
-        pathPattern: options.pathPattern,
-        region: options.region,
-        profile: options.profile,
-        filters: options.filters?.split(','),
-        compact: options.compact,
-        output: options.json ? 'json' : 'hcl',
-        verbose: options.verbose,
-        noSort: options.noSort
-      };
+function list(value?: string): string[] | undefined {
+  return value?.split(',').map(v => v.trim()).filter(Boolean);
+}
 
-      const spinner = ora('Importing AWS resources...').start();
+function addCommonOptions(command: Command, provider: ProviderName): Command {
+  command
+    .option('-r, --resources <services>', 'Comma-separated services to import, or "*" for all', '*')
+    .option('-x, --excludes <services>', 'Comma-separated services to skip')
+    .option('-o, --output <path>', 'Output directory', 'generated')
+    .option('-p, --path-pattern <pattern>', 'Output path pattern (placeholders: {output} {provider} {region} {service})')
+    .option('-f, --filter <filter>', 'Resource filter, e.g. "aws_s3_bucket=b1:b2" or "Type=ec2;Name=tags.Env;Value=prod" (repeatable)', collect, [])
+    .option('--filters <filters>', 'Comma-separated resource filters')
+    .option('--compact', 'Write all services into one directory per region')
+    .option('--json', 'Write provider and import blocks in Terraform JSON syntax')
+    .option('--no-sort', 'Keep import blocks in discovery order')
+    .option('--no-generate', 'Only write import blocks; skip "terraform plan -generate-config-out"')
+    .option('--terraform-bin <path>', 'Path to the terraform binary', 'terraform')
+    .option('-v, --verbose', 'Verbose output');
 
-      await terraformer.import(importOptions, (message: string, current: number, total: number) => {
+  switch (provider) {
+    case 'aws':
+      command
+        .option('--region <regions>', 'AWS region(s), comma-separated', process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1')
+        .option('--profile <profile>', 'AWS shared config profile', process.env.AWS_PROFILE || 'default');
+      break;
+    case 'azure':
+      command
+        .option('--subscription <id>', 'Azure subscription ID (defaults to ARM_SUBSCRIPTION_ID / AZURE_SUBSCRIPTION_ID)')
+        .option('--resource-group <name>', 'Only import resources in this resource group');
+      break;
+    case 'google':
+      command
+        .option('--projects <projects>', 'GCP project ID(s), comma-separated (defaults to GOOGLE_CLOUD_PROJECT)');
+      break;
+  }
+  return command;
+}
+
+function buildProviderConfig(provider: ProviderName, options: CliOptions): ProviderConfig {
+  switch (provider) {
+    case 'aws':
+      return { region: list(options.region)?.[0], profile: options.profile };
+    case 'azure':
+      return { subscriptionId: options.subscription, resourceGroup: options.resourceGroup };
+    case 'google':
+      return { project: list(options.projects)?.[0] };
+  }
+}
+
+function buildImportOptions(provider: ProviderName, options: CliOptions): ImportOptions {
+  return {
+    resources: list(options.resources) || ['*'],
+    excludes: list(options.excludes),
+    pathOutput: options.output,
+    pathPattern: options.pathPattern,
+    regions: provider === 'aws' ? list(options.region) : undefined,
+    projects: provider === 'google' ? list(options.projects) : undefined,
+    profile: options.profile,
+    resourceGroup: options.resourceGroup,
+    filters: [...options.filter, ...(list(options.filters) || [])],
+    compact: options.compact,
+    output: options.json ? 'json' : 'hcl',
+    verbose: options.verbose,
+    noSort: options.sort === false,
+    // undefined = generate when Terraform is installed.
+    generate: options.generate === false ? false : undefined,
+    terraformBin: options.terraformBin
+  };
+}
+
+async function runImport(providerName: ProviderName, options: CliOptions): Promise<void> {
+  const logger = new ConsoleLogger(options.verbose);
+  const provider = await createProvider(providerName, buildProviderConfig(providerName, options), logger);
+  const terraformer = new Terraformer(provider, logger);
+  const spinner = options.verbose ? null : ora(`Importing ${providerName} resources...`).start();
+  if (spinner) {
+    silenceInfo(logger);
+  }
+
+  try {
+    const result = await terraformer.import(buildImportOptions(providerName, options), (message, current, total) => {
+      if (spinner) {
         spinner.text = `${message} (${current}/${total})`;
-      });
+      }
+    });
+    spinner?.stop();
+    printSummary(result);
+  } catch (error) {
+    spinner?.fail(chalk.red('Import failed'));
+    throw error;
+  }
+}
 
-      spinner.succeed(chalk.green('Import completed successfully!'));
-      
-      console.log(chalk.blue(`\nGenerated files in: ${options.output}`));
-      console.log(chalk.gray('You can now run:'));
-      console.log(chalk.gray(`  cd ${options.output}`));
-      console.log(chalk.gray('  terraform init'));
-      console.log(chalk.gray('  terraform plan'));
+function printSummary(result: ImportResult): void {
+  console.log(chalk.green(`\nDiscovered ${result.resources.length} resources.`));
 
+  for (const directory of result.directories) {
+    const status = directory.generation === 'succeeded' ? chalk.green('config generated')
+      : directory.generation === 'failed' ? chalk.yellow('needs review')
+        : chalk.gray('import blocks only');
+    console.log(`  ${directory.path}  ${chalk.gray(`${directory.resourceCount} resources`)}  ${status}`);
+  }
+
+  if (result.warnings.length > 0) {
+    console.log(chalk.yellow(`\n${result.warnings.length} warning(s):`));
+    for (const warning of result.warnings) {
+      console.log(chalk.yellow(`  - ${warning}`));
+    }
+  }
+
+  if (result.directories.length === 0) {
+    return;
+  }
+  const generated = result.directories.some(d => d.generation !== 'skipped');
+  console.log(chalk.blue('\nNext steps, in each output directory:'));
+  if (!generated) {
+    console.log(chalk.gray('  terraform init'));
+    console.log(chalk.gray('  terraform plan -generate-config-out=generated.tf   # writes the resource blocks'));
+  }
+  console.log(chalk.gray('  review generated.tf, then:'));
+  console.log(chalk.gray('  terraform plan    # should only show imports'));
+  console.log(chalk.gray('  terraform apply   # records the imported resources in Terraform state'));
+}
+
+/** While the spinner runs, info logs would garble it; warnings are shown in the summary. */
+function silenceInfo(logger: ConsoleLogger): void {
+  logger.info = () => {};
+  logger.warn = () => {};
+}
+
+function addProviderCommand(name: string, provider: ProviderName, description: string, aliases: string[] = []): void {
+  const command = program.command(name).description(description);
+  aliases.forEach(alias => command.alias(alias));
+  addCommonOptions(command, provider).action(async (options: CliOptions) => {
+    try {
+      await runImport(provider, options);
     } catch (error) {
-      console.error(chalk.red('Import failed:'), error);
+      console.error(chalk.red('Import failed:'), error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
+}
+
+addProviderCommand('aws', 'aws', 'Import AWS resources');
+addProviderCommand('azure', 'azure', 'Import Azure resources', ['azurerm']);
+addProviderCommand('google', 'google', 'Import Google Cloud resources', ['gcp']);
 
 // Plan Command
-program
+const planCommand = program
   .command('plan <provider>')
-  .description('Generate import plan')
-  .option('-r, --resources <resources>', 'Comma-separated list of resources to import', 'ec2,s3')
-  .option('-o, --output <path>', 'Output directory', 'generated')
-  .option('--region <region>', 'AWS region', 'us-east-1')
-  .option('--profile <profile>', 'AWS profile', 'default')
-  .option('-v, --verbose', 'Verbose output')
-  .action(async (provider, options) => {
+  .description('Discover resources and write them to plan.json without generating Terraform files');
+// `plan` accepts the flags of every provider.
+addCommonOptions(planCommand, 'aws');
+planCommand
+  .option('--subscription <id>', 'Azure subscription ID')
+  .option('--resource-group <name>', 'Azure resource group')
+  .option('--projects <projects>', 'GCP project ID(s), comma-separated')
+  .action(async (providerArg: string, options: CliOptions) => {
     try {
-      const logger = new ConsoleLogger(options.verbose);
-      
-      if (provider === 'aws') {
-        const config: ProviderConfig = {
-          region: options.region,
-          profile: options.profile
-        };
-
-        const awsProvider = new AWSProvider(config, logger);
-        const terraformer = new Terraformer(awsProvider, logger);
-
-        const importOptions: ImportOptions = {
-          resources: options.resources.split(','),
-          pathOutput: options.output,
-          region: options.region,
-          profile: options.profile,
-          verbose: options.verbose
-        };
-
-        await terraformer.plan(importOptions);
-        console.log(chalk.green('Plan generated successfully!'));
-      } else {
-        console.error(chalk.red(`Unsupported provider: ${provider}`));
-        process.exit(1);
+      const providerName = resolveProviderName(providerArg);
+      if (!providerName) {
+        throw new Error(`Unsupported provider "${providerArg}". Supported providers: ${SUPPORTED_PROVIDERS.join(', ')}`);
       }
+      const logger = new ConsoleLogger(options.verbose);
+      const provider = await createProvider(providerName, buildProviderConfig(providerName, options), logger);
+      const result = await new Terraformer(provider, logger).plan(buildImportOptions(providerName, options));
+      console.log(chalk.green(`Plan generated successfully: ${result.resources.length} resources.`));
     } catch (error) {
-      console.error(chalk.red('Plan generation failed:'), error);
+      console.error(chalk.red('Plan generation failed:'), error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
@@ -121,29 +218,19 @@ program
 // List Command
 program
   .command('list <provider>')
-  .description('List supported resources for a provider')
-  .action(async (provider) => {
+  .description('List supported services for a provider')
+  .action(async (providerArg: string) => {
     try {
-      const logger = new ConsoleLogger();
-      
-      if (provider === 'aws') {
-        const config: ProviderConfig = { region: 'us-east-1' };
-        const awsProvider = new AWSProvider(config, logger);
-        const terraformer = new Terraformer(awsProvider, logger);
-        
-        const services = terraformer.getSupportedServices();
-        
-        console.log(chalk.blue(`\nSupported AWS services:\n`));
-        services.forEach((service: string) => {
-          console.log(chalk.gray(`  - ${service}`));
-        });
-        console.log();
-      } else {
-        console.error(chalk.red(`Unsupported provider: ${provider}`));
-        process.exit(1);
-      }
+      const provider = await createProvider(providerArg, {}, new ConsoleLogger());
+      const services = Object.keys(provider.getSupportedServices()).sort();
+      console.log(chalk.blue(`\nSupported ${provider.getName()} services (${services.length}):\n`));
+      services.forEach(service => {
+        const global = provider.isGlobalService(service) ? chalk.gray(' (global)') : '';
+        console.log(`  - ${service}${global}`);
+      });
+      console.log();
     } catch (error) {
-      console.error(chalk.red('Failed to list resources:'), error);
+      console.error(chalk.red('Failed to list services:'), error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
@@ -154,76 +241,69 @@ program
   .description('Interactive mode for resource selection')
   .action(async () => {
     try {
+      const { provider: providerName } = await inquirer.prompt([{
+        type: 'list',
+        name: 'provider',
+        message: 'Select cloud provider:',
+        choices: [...SUPPORTED_PROVIDERS]
+      }]);
+      const listing = await createProvider(providerName, {}, new ConsoleLogger());
+      const services = Object.keys(listing.getSupportedServices()).sort();
+
       const answers = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'provider',
-          message: 'Select cloud provider:',
-          choices: ['aws', 'gcp', 'azure']
-        },
         {
           type: 'checkbox',
           name: 'resources',
-          message: 'Select resources to import:',
-          choices: [
-            { name: 'EC2 Instances', value: 'ec2' },
-            { name: 'S3 Buckets', value: 's3' },
-            { name: 'RDS Databases', value: 'rds' },
-            { name: 'Lambda Functions', value: 'lambda' },
-            { name: 'VPCs', value: 'vpc' },
-            { name: 'Security Groups', value: 'sg' }
-          ]
+          message: 'Select services to import:',
+          choices: services,
+          validate: (selected: string[]) => selected.length > 0 || 'Select at least one service'
         },
         {
           type: 'input',
-          name: 'region',
-          message: 'Enter region:',
-          default: 'us-east-1'
+          name: 'scope',
+          message: providerName === 'aws' ? 'AWS region(s), comma-separated:'
+            : providerName === 'azure' ? 'Azure subscription ID (empty = from environment):'
+              : 'GCP project ID(s), comma-separated (empty = from environment):',
+          default: providerName === 'aws' ? (process.env.AWS_REGION || 'us-east-1') : ''
         },
         {
           type: 'input',
           name: 'output',
-          message: 'Enter output directory:',
+          message: 'Output directory:',
           default: 'generated'
         }
       ]);
 
-      console.log(chalk.blue('\nStarting import with selected options...'));
-      
-      const logger = new ConsoleLogger(true);
-      const config: ProviderConfig = {
-        region: answers.region
-      };
-
-      const provider = new AWSProvider(config, logger);
-      const terraformer = new Terraformer(provider, logger);
-
-      const importOptions: ImportOptions = {
-        resources: answers.resources,
-        pathOutput: answers.output,
-        region: answers.region,
-        verbose: true
-      };
-
-      const spinner = ora('Importing resources...').start();
-
-      await terraformer.import(importOptions, (message: string, current: number, total: number) => {
-        spinner.text = `${message} (${current}/${total})`;
+      const scope = answers.scope.trim() || undefined;
+      await runImport(providerName, {
+        resources: answers.resources.join(','),
+        output: answers.output,
+        filter: [],
+        sort: true,
+        generate: true,
+        terraformBin: 'terraform',
+        region: providerName === 'aws' ? scope : undefined,
+        subscription: providerName === 'azure' ? scope : undefined,
+        projects: providerName === 'google' ? scope : undefined
       });
-
-      spinner.succeed(chalk.green('Import completed successfully!'));
-      
     } catch (error) {
-      console.error(chalk.red('Interactive mode failed:'), error);
+      console.error(chalk.red('Interactive mode failed:'), error instanceof Error ? error.message : error);
       process.exit(1);
     }
   });
 
-// Error handling
 program.on('command:*', () => {
   console.error(chalk.red('Invalid command. See --help for available commands.'));
   process.exit(1);
 });
 
-// Parse command line arguments
+function readVersion(): string {
+  try {
+    const packageJson = path.join(__dirname, '..', '..', 'package.json');
+    return JSON.parse(fs.readFileSync(packageJson, 'utf8')).version;
+  } catch {
+    return '0.0.0';
+  }
+}
+
 program.parse();
