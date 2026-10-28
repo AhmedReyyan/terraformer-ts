@@ -355,7 +355,13 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 - 💼 LinkedIn: [linkedin.com/in/ahmed-r-0568b3222/](https://linkedin.com/in/ahmed-r-0568b3222/)
 - 🐙 GitHub: [@AhmedReyyan](https://github.com/AhmedReyyan)
 
+## 👨‍💻 Co-Author
+
+**Muhammad Shahbaz**
+- 🌐 Portfolio: [mshahbaz.me](https://mshahbaz.me)
+- 🐙 GitHub: [@Shahbaz4462](https://github.com/Shahbaz4462)
+
 ---
 
-**Made with ❤️ by Ahmed Reyyan**
+**Made with ❤️ by Ahmed Reyyan & Muhammad Shahbaz**
 

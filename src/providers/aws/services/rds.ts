@@ -1,500 +1,306 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
-import { 
-  RDSClient, 
-  DescribeDBClustersCommand, 
-  DescribeDBClusterSnapshotsCommand,
-  DescribeDBInstancesCommand,
-  DescribeDBSnapshotsCommand,
-  DescribeDBProxiesCommand,
-  DescribeDBParameterGroupsCommand,
-  DescribeDBSubnetGroupsCommand,
-  DescribeOptionGroupsCommand,
-  DescribeEventSubscriptionsCommand,
-  DescribeGlobalClustersCommand
+import {
+  RDSClient,
+  DBCluster,
+  DBInstance,
+  paginateDescribeDBInstances,
+  paginateDescribeDBClusters,
+  paginateDescribeDBSubnetGroups,
+  paginateDescribeDBParameterGroups,
+  paginateDescribeDBClusterParameterGroups,
+  paginateDescribeDBClusterEndpoints,
+  paginateDescribeOptionGroups,
+  paginateDescribeEventSubscriptions,
+  paginateDescribeDBProxies,
+  paginateDescribeDBProxyEndpoints,
+  paginateDescribeDBProxyTargets,
+  paginateDescribeGlobalClusters
 } from '@aws-sdk/client-rds';
+import { mapLimit } from '../../../core/provider';
+import { AwsService, tagMap } from '../aws-service';
 
-export class RDSService extends BaseService {
-  private client: RDSClient;
+/**
+ * The RDS, DocumentDB and Neptune APIs share one backend: DescribeDBClusters,
+ * DescribeDBInstances, the subnet/parameter group calls and DescribeGlobalClusters of
+ * each of them return the objects of all three engines. Each object is imported by
+ * exactly one of the `rds`, `docdb` and `neptune` services, decided by these helpers.
+ */
+export type DbFamily = 'rds' | 'docdb' | 'neptune';
 
-  constructor(providerName: string, serviceName: string, config: ProviderConfig, logger: Logger) {
-    super(providerName, serviceName, config, logger);
-    this.client = new RDSClient({
-      region: config.region || 'us-east-1',
-      credentials: config.credentials ? {
-        accessKeyId: config.credentials.accessKeyId || '',
-        secretAccessKey: config.credentials.secretAccessKey || '',
-        sessionToken: config.credentials.sessionToken || undefined
-      } : undefined
-    });
+/** The owning service of an engine name (`docdb`, `neptune`, `aurora-mysql`) or parameter group family (`docdb5.0`, `neptune1.3`). */
+export function dbFamily(engineOrFamily: string | undefined): DbFamily {
+  const value = (engineOrFamily || '').toLowerCase();
+  if (value.startsWith('docdb')) {
+    return 'docdb';
   }
+  if (value.startsWith('neptune')) {
+    return 'neptune';
+  }
+  return 'rds';
+}
 
+export interface SubnetGroupUse {
+  subnetGroup?: string;
+  engine?: string;
+}
+
+/**
+ * Subnet groups are one object for all three engines. A subnet group is owned by
+ * `docdb` / `neptune` only when every cluster/instance using it has that engine;
+ * unused or mixed-use subnet groups are owned by `rds` (aws_db_subnet_group).
+ */
+export function subnetGroupOwners(uses: SubnetGroupUse[]): Map<string, DbFamily> {
+  const families = new Map<string, Set<DbFamily>>();
+  for (const use of uses) {
+    if (use.subnetGroup) {
+      const set = families.get(use.subnetGroup) || new Set<DbFamily>();
+      set.add(dbFamily(use.engine));
+      families.set(use.subnetGroup, set);
+    }
+  }
+  const owners = new Map<string, DbFamily>();
+  for (const [name, set] of families) {
+    owners.set(name, set.size === 1 ? [...set][0] : 'rds');
+  }
+  return owners;
+}
+
+/**
+ * Global clusters are returned by DescribeGlobalClusters in every region. Import a
+ * global cluster only in the region of its writer (primary) member cluster, so it is
+ * imported once. Global clusters without a writer member are skipped.
+ */
+export function globalClusterHomeRegion(members: Array<{ DBClusterArn?: string; IsWriter?: boolean }> | undefined): string | undefined {
+  const writer = members?.find(member => member.IsWriter && member.DBClusterArn);
+  return writer?.DBClusterArn?.split(':')[3];
+}
+
+/** Statuses of objects that are going away or never came up; they are not imported. */
+export const SKIPPED_DB_STATUSES = new Set(['deleting', 'failed']);
+
+export class RDSService extends AwsService {
   async initResources(): Promise<void> {
-    await this.loadDBClusters();
-    await this.loadDBClusterSnapshots();
-    await this.loadDBInstances();
-    await this.loadDBInstanceSnapshots();
-    await this.loadDBProxies();
-    await this.loadDBParameterGroups();
-    await this.loadDBSubnetGroups();
-    await this.loadOptionGroups();
-    await this.loadEventSubscriptions();
-    await this.loadGlobalClusters();
-  }
+    const rds = this.client(RDSClient);
+    // Unfiltered: DocumentDB/Neptune objects are needed to decide subnet group ownership.
+    const clusters: DBCluster[] = [];
+    const instances: DBInstance[] = [];
+    let usesComplete = true;
 
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    const filters: ResourceFilter[] = [];
-    
-    if (!rawFilter.includes('Name=') && rawFilter.includes('=')) {
-      const [serviceName, resourcesId] = rawFilter.split('=');
-      filters.push({
-        serviceName,
-        fieldPath: 'id',
-        acceptableValues: resourcesId.split(':'),
-        isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-      });
-    } else {
-      const parts = rawFilter.split(';');
-      if (parts.length >= 1) {
-        const serviceName = parts[0].startsWith('Type=') ? parts[0].substring(5) : '';
-        const fieldPath = parts[1]?.startsWith('Name=') ? parts[1].substring(5) : parts[0];
-        const acceptableValues = parts[2]?.startsWith('Value=') ? 
-          parts[2].substring(6).split(':') : undefined;
-
-        filters.push({
-          serviceName,
-          fieldPath,
-          acceptableValues: acceptableValues || [],
-          isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
+    await this.collect('RDS clusters', async () => {
+      try {
+        for await (const page of paginateDescribeDBClusters({ client: rds }, {})) {
+          clusters.push(...(page.DBClusters || []));
+        }
+      } catch (error) {
+        usesComplete = false;
+        throw error;
+      }
+      for (const cluster of clusters) {
+        const id = cluster.DBClusterIdentifier;
+        if (!id || dbFamily(cluster.Engine) !== 'rds' || SKIPPED_DB_STATUSES.has(cluster.Status || '')) {
+          continue;
+        }
+        this.add('aws_rds_cluster', id, id, {
+          cluster_identifier: id,
+          arn: cluster.DBClusterArn,
+          engine: cluster.Engine,
+          tags: tagMap(cluster.TagList)
         });
       }
-    }
+    });
 
-    return filters;
-  }
-
-  async postConvertHook(): Promise<void> {
-    this.log('Running RDS post-conversion hook...', 'debug');
-  }
-
-  private async loadDBClusters(): Promise<void> {
-    try {
-      this.log('Loading RDS DB clusters...', 'info');
-      
-      const command = new DescribeDBClustersCommand({});
-      const response = await this.client.send(command);
-      
-      let clusterCount = 0;
-      for (const cluster of response.DBClusters || []) {
-        if (cluster.DBClusterIdentifier) {
-          const resource = this.createResource(
-            cluster.DBClusterIdentifier,
-            cluster.DBClusterIdentifier,
-            'rds_cluster',
-            {},
-            {
-              cluster_identifier: cluster.DBClusterIdentifier,
-              engine: cluster.Engine,
-              engine_version: cluster.EngineVersion,
-              database_name: cluster.DatabaseName,
-              master_username: cluster.MasterUsername,
-              port: cluster.Port,
-              backup_retention_period: cluster.BackupRetentionPeriod,
-              preferred_backup_window: cluster.PreferredBackupWindow,
-              preferred_maintenance_window: cluster.PreferredMaintenanceWindow,
-              vpc_security_group_ids: cluster.VpcSecurityGroups?.map(sg => sg.VpcSecurityGroupId) || [],
-              db_subnet_group_name: cluster.DBSubnetGroup,
-              db_cluster_parameter_group_name: cluster.DBClusterParameterGroup,
-              availability_zones: cluster.AvailabilityZones || [],
-              storage_encrypted: cluster.StorageEncrypted,
-              kms_key_id: cluster.KmsKeyId,
-              deletion_protection: cluster.DeletionProtection,
-              enabled_cloudwatch_logs_exports: cluster.EnabledCloudwatchLogsExports || []
-            }
-          );
-          
-          this.addResource(resource);
-          clusterCount++;
+    await this.collect('RDS cluster endpoints', async () => {
+      const rdsClusters = new Set(clusters.filter(c => dbFamily(c.Engine) === 'rds').map(c => c.DBClusterIdentifier));
+      for await (const page of paginateDescribeDBClusterEndpoints({ client: rds }, {})) {
+        for (const endpoint of page.DBClusterEndpoints || []) {
+          const id = endpoint.DBClusterEndpointIdentifier;
+          // Only custom endpoints are separate objects; the writer/reader endpoints belong to the cluster.
+          if (!id || endpoint.EndpointType !== 'CUSTOM' || !rdsClusters.has(endpoint.DBClusterIdentifier)
+            || endpoint.Status === 'deleting') {
+            continue;
+          }
+          this.add('aws_rds_cluster_endpoint', id, id, {
+            cluster_endpoint_identifier: id, cluster_identifier: endpoint.DBClusterIdentifier, arn: endpoint.DBClusterEndpointArn
+          });
         }
       }
-      
-      this.log(`Loaded ${clusterCount} RDS DB clusters`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB clusters: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBClusterSnapshots(): Promise<void> {
-    try {
-      this.log('Loading RDS DB cluster snapshots...', 'info');
-      
-      const command = new DescribeDBClusterSnapshotsCommand({});
-      const response = await this.client.send(command);
-      
-      let snapshotCount = 0;
-      for (const snapshot of response.DBClusterSnapshots || []) {
-        if (snapshot.DBClusterSnapshotIdentifier) {
-          const resource = this.createResource(
-            snapshot.DBClusterSnapshotIdentifier,
-            snapshot.DBClusterSnapshotIdentifier,
-            'db_cluster_snapshot',
-            {},
-            {
-              db_cluster_snapshot_identifier: snapshot.DBClusterSnapshotIdentifier,
-              db_cluster_identifier: snapshot.DBClusterIdentifier,
-              snapshot_type: snapshot.SnapshotType,
-              status: snapshot.Status,
-              percent_progress: snapshot.PercentProgress,
-              storage_encrypted: snapshot.StorageEncrypted,
-              kms_key_id: snapshot.KmsKeyId,
-              snapshot_create_time: snapshot.SnapshotCreateTime
-            }
-          );
-          
-          this.addResource(resource);
-          snapshotCount++;
+    await this.collect('RDS instances', async () => {
+      try {
+        for await (const page of paginateDescribeDBInstances({ client: rds }, {})) {
+          instances.push(...(page.DBInstances || []));
+        }
+      } catch (error) {
+        usesComplete = false;
+        throw error;
+      }
+      for (const instance of instances) {
+        const id = instance.DBInstanceIdentifier;
+        if (!id || dbFamily(instance.Engine) !== 'rds' || SKIPPED_DB_STATUSES.has(instance.DBInstanceStatus || '')) {
+          continue;
+        }
+        const attributes = {
+          identifier: id,
+          arn: instance.DBInstanceArn,
+          engine: instance.Engine,
+          cluster_identifier: instance.DBClusterIdentifier,
+          tags: tagMap(instance.TagList)
+        };
+        if (!instance.DBClusterIdentifier) {
+          this.add('aws_db_instance', id, id, attributes);
+        } else if ((instance.Engine || '').startsWith('aurora')) {
+          this.add('aws_rds_cluster_instance', id, id, attributes);
+        }
+        // Members of Multi-AZ DB clusters (mysql/postgres with a cluster) are created and
+        // managed by their aws_rds_cluster (db_cluster_instance_class), so they are skipped.
+      }
+    });
+
+    await this.collect('RDS subnet groups', async () => {
+      // Without the full cluster/instance list ownership is unknown: claim every group.
+      const owners = usesComplete ? subnetGroupOwners(dbUses(clusters, instances)) : new Map<string, DbFamily>();
+      for await (const page of paginateDescribeDBSubnetGroups({ client: rds }, {})) {
+        for (const group of page.DBSubnetGroups || []) {
+          const name = group.DBSubnetGroupName;
+          // `default` is the AWS-created default subnet group of the default VPC.
+          if (!name || name === 'default' || (owners.get(name) || 'rds') !== 'rds') {
+            continue;
+          }
+          this.add('aws_db_subnet_group', name, name, { name, arn: group.DBSubnetGroupArn, vpc_id: group.VpcId });
         }
       }
-      
-      this.log(`Loaded ${snapshotCount} RDS DB cluster snapshots`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB cluster snapshots: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBInstances(): Promise<void> {
-    try {
-      this.log('Loading RDS DB instances...', 'info');
-      
-      const command = new DescribeDBInstancesCommand({});
-      const response = await this.client.send(command);
-      
-      let instanceCount = 0;
-      for (const instance of response.DBInstances || []) {
-        if (instance.DBInstanceIdentifier) {
-          const resource = this.createResource(
-            instance.DBInstanceIdentifier,
-            instance.DBInstanceIdentifier,
-            'db_instance',
-            {},
-            {
-              identifier: instance.DBInstanceIdentifier,
-              engine: instance.Engine,
-              engine_version: instance.EngineVersion,
-              instance_class: instance.DBInstanceClass,
-              allocated_storage: instance.AllocatedStorage,
-              storage_type: instance.StorageType,
-              storage_encrypted: instance.StorageEncrypted,
-              kms_key_id: instance.KmsKeyId,
-              db_name: instance.DBName,
-              master_username: instance.MasterUsername,
-              port: instance.DbInstancePort,
-              vpc_security_group_ids: instance.VpcSecurityGroups?.map(sg => sg.VpcSecurityGroupId) || [],
-              db_subnet_group_name: instance.DBSubnetGroup?.DBSubnetGroupName,
-              parameter_group_name: instance.DBParameterGroups?.[0]?.DBParameterGroupName,
-              option_group_name: instance.OptionGroupMemberships?.[0]?.OptionGroupName,
-              availability_zone: instance.AvailabilityZone,
-              multi_az: instance.MultiAZ,
-              publicly_accessible: instance.PubliclyAccessible,
-              backup_retention_period: instance.BackupRetentionPeriod,
-              backup_window: instance.PreferredBackupWindow,
-              maintenance_window: instance.PreferredMaintenanceWindow,
-              auto_minor_version_upgrade: instance.AutoMinorVersionUpgrade,
-              deletion_protection: instance.DeletionProtection,
-              performance_insights_enabled: instance.PerformanceInsightsEnabled,
-              performance_insights_kms_key_id: instance.PerformanceInsightsKMSKeyId,
-              monitoring_interval: instance.MonitoringInterval,
-              monitoring_role_arn: instance.MonitoringRoleArn,
-              enabled_cloudwatch_logs_exports: instance.EnabledCloudwatchLogsExports || []
-            }
-          );
-          
-          this.addResource(resource);
-          instanceCount++;
+    await this.collect('RDS parameter groups', async () => {
+      for await (const page of paginateDescribeDBParameterGroups({ client: rds }, {})) {
+        for (const group of page.DBParameterGroups || []) {
+          const name = group.DBParameterGroupName;
+          // `default.*` groups are AWS-managed; Neptune groups belong to the neptune service.
+          if (!name || name.startsWith('default.') || dbFamily(group.DBParameterGroupFamily) !== 'rds') {
+            continue;
+          }
+          this.add('aws_db_parameter_group', name, name, {
+            name, arn: group.DBParameterGroupArn, family: group.DBParameterGroupFamily
+          });
         }
       }
-      
-      this.log(`Loaded ${instanceCount} RDS DB instances`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB instances: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBInstanceSnapshots(): Promise<void> {
-    try {
-      this.log('Loading RDS DB instance snapshots...', 'info');
-      
-      const command = new DescribeDBSnapshotsCommand({});
-      const response = await this.client.send(command);
-      
-      let snapshotCount = 0;
-      for (const snapshot of response.DBSnapshots || []) {
-        if (snapshot.DBSnapshotIdentifier) {
-          const resource = this.createResource(
-            snapshot.DBSnapshotIdentifier,
-            snapshot.DBSnapshotIdentifier,
-            'db_snapshot',
-            {},
-            {
-              db_snapshot_identifier: snapshot.DBSnapshotIdentifier,
-              db_instance_identifier: snapshot.DBInstanceIdentifier,
-              snapshot_type: snapshot.SnapshotType,
-              status: snapshot.Status,
-              percent_progress: snapshot.PercentProgress,
-              storage_type: snapshot.StorageType,
-              storage_encrypted: snapshot.Encrypted,
-              kms_key_id: snapshot.KmsKeyId,
-              snapshot_create_time: snapshot.SnapshotCreateTime,
-              allocated_storage: snapshot.AllocatedStorage,
-              engine: snapshot.Engine,
-              engine_version: snapshot.EngineVersion,
-              license_model: snapshot.LicenseModel,
-              iops: snapshot.Iops,
-              option_group_name: snapshot.OptionGroupName,
-              port: snapshot.Port,
-              availability_zone: snapshot.AvailabilityZone,
-              vpc_id: snapshot.VpcId
-            }
-          );
-          
-          this.addResource(resource);
-          snapshotCount++;
+    await this.collect('RDS cluster parameter groups', async () => {
+      for await (const page of paginateDescribeDBClusterParameterGroups({ client: rds }, {})) {
+        for (const group of page.DBClusterParameterGroups || []) {
+          const name = group.DBClusterParameterGroupName;
+          // `default.*` groups are AWS-managed; DocumentDB/Neptune groups belong to their services.
+          if (!name || name.startsWith('default.') || dbFamily(group.DBParameterGroupFamily) !== 'rds') {
+            continue;
+          }
+          this.add('aws_rds_cluster_parameter_group', name, name, {
+            name, arn: group.DBClusterParameterGroupArn, family: group.DBParameterGroupFamily
+          });
         }
       }
-      
-      this.log(`Loaded ${snapshotCount} RDS DB instance snapshots`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB instance snapshots: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBProxies(): Promise<void> {
-    try {
-      this.log('Loading RDS DB proxies...', 'info');
-      
-      const command = new DescribeDBProxiesCommand({});
-      const response = await this.client.send(command);
-      
-      let proxyCount = 0;
-      for (const proxy of response.DBProxies || []) {
-        if (proxy.DBProxyName) {
-          const resource = this.createResource(
-            proxy.DBProxyName,
-            proxy.DBProxyName,
-            'db_proxy',
-            {},
-            {
-              name: proxy.DBProxyName,
-              engine_family: proxy.EngineFamily,
-              auth: proxy.Auth?.map(auth => ({
-                auth_scheme: auth.AuthScheme,
-                description: auth.Description,
-                iam_auth: auth.IAMAuth,
-                secret_arn: auth.SecretArn,
-                username: auth.UserName
-              })) || [],
-              role_arn: proxy.RoleArn,
-              vpc_subnet_ids: proxy.VpcSubnetIds || [],
-              require_tls: proxy.RequireTLS,
-              idle_client_timeout: proxy.IdleClientTimeout,
-              debug_logging: proxy.DebugLogging
-            }
-          );
-          
-          this.addResource(resource);
-          proxyCount++;
+    await this.collect('RDS option groups', async () => {
+      for await (const page of paginateDescribeOptionGroups({ client: rds }, {})) {
+        for (const group of page.OptionGroupsList || []) {
+          const name = group.OptionGroupName;
+          // `default:<engine>-<version>` option groups are AWS-managed.
+          if (!name || name.startsWith('default:')) {
+            continue;
+          }
+          this.add('aws_db_option_group', name, name, { name, arn: group.OptionGroupArn, engine_name: group.EngineName });
         }
       }
-      
-      this.log(`Loaded ${proxyCount} RDS DB proxies`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB proxies: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBParameterGroups(): Promise<void> {
-    try {
-      this.log('Loading RDS DB parameter groups...', 'info');
-      
-      const command = new DescribeDBParameterGroupsCommand({});
-      const response = await this.client.send(command);
-      
-      let groupCount = 0;
-      for (const group of response.DBParameterGroups || []) {
-        if (group.DBParameterGroupName && !group.DBParameterGroupName.includes('.')) {
-          // Skip default parameter groups
-          const resource = this.createResource(
-            group.DBParameterGroupName,
-            group.DBParameterGroupName,
-            'db_parameter_group',
-            {},
-            {
-              name: group.DBParameterGroupName,
-              family: group.DBParameterGroupFamily,
-              description: group.Description
-            }
-          );
-          
-          this.addResource(resource);
-          groupCount++;
+    await this.collect('RDS event subscriptions', async () => {
+      // The subscription API is shared with DocumentDB/Neptune and has no engine field,
+      // so all subscriptions are imported here as aws_db_event_subscription.
+      for await (const page of paginateDescribeEventSubscriptions({ client: rds }, {})) {
+        for (const subscription of page.EventSubscriptionsList || []) {
+          const name = subscription.CustSubscriptionId;
+          if (!name || subscription.Status === 'deleting') {
+            continue;
+          }
+          this.add('aws_db_event_subscription', name, name, { name, arn: subscription.EventSubscriptionArn });
         }
       }
-      
-      this.log(`Loaded ${groupCount} RDS DB parameter groups`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB parameter groups: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadDBSubnetGroups(): Promise<void> {
-    try {
-      this.log('Loading RDS DB subnet groups...', 'info');
-      
-      const command = new DescribeDBSubnetGroupsCommand({});
-      const response = await this.client.send(command);
-      
-      let groupCount = 0;
-      for (const group of response.DBSubnetGroups || []) {
-        if (group.DBSubnetGroupName) {
-          const resource = this.createResource(
-            group.DBSubnetGroupName,
-            group.DBSubnetGroupName,
-            'db_subnet_group',
-            {},
-            {
-              name: group.DBSubnetGroupName,
-              description: group.DBSubnetGroupDescription,
-              subnet_ids: group.Subnets?.map(subnet => subnet.SubnetIdentifier) || [],
-              vpc_id: group.VpcId
-            }
-          );
-          
-          this.addResource(resource);
-          groupCount++;
+    await this.collect('RDS proxies', async () => {
+      const proxies: string[] = [];
+      for await (const page of paginateDescribeDBProxies({ client: rds }, {})) {
+        for (const proxy of page.DBProxies || []) {
+          const name = proxy.DBProxyName;
+          if (!name || proxy.Status === 'deleting') {
+            continue;
+          }
+          proxies.push(name);
+          this.add('aws_db_proxy', name, name, { name, arn: proxy.DBProxyArn, engine_family: proxy.EngineFamily });
+          // Every proxy has exactly one target group, `default`, imported by proxy name.
+          this.add('aws_db_proxy_default_target_group', name, name, { db_proxy_name: name });
         }
       }
-      
-      this.log(`Loaded ${groupCount} RDS DB subnet groups`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS DB subnet groups: ${error}`, 'error');
-      throw error;
-    }
-  }
 
-  private async loadOptionGroups(): Promise<void> {
-    try {
-      this.log('Loading RDS option groups...', 'info');
-      
-      const command = new DescribeOptionGroupsCommand({});
-      const response = await this.client.send(command);
-      
-      let groupCount = 0;
-      for (const group of response.OptionGroupsList || []) {
-        if (group.OptionGroupName && !group.OptionGroupName.includes('.') && !group.OptionGroupName.includes(':')) {
-          // Skip default option groups
-          const resource = this.createResource(
-            group.OptionGroupName,
-            group.OptionGroupName,
-            'db_option_group',
-            {},
-            {
-              name: group.OptionGroupName,
-              option_group_description: group.OptionGroupDescription,
-              engine_name: group.EngineName,
-              major_engine_version: group.MajorEngineVersion
+      await mapLimit(proxies, 5, proxy => this.collect(`RDS proxy targets of ${proxy}`, async () => {
+        for await (const page of paginateDescribeDBProxyTargets({ client: rds }, { DBProxyName: proxy, TargetGroupName: 'default' })) {
+          for (const target of page.Targets || []) {
+            // Instances of a registered (tracked) cluster are listed as targets too, but are
+            // registered implicitly by the TRACKED_CLUSTER target.
+            if (!target.RdsResourceId || !target.Type || (target.Type === 'RDS_INSTANCE' && target.TrackedClusterId)) {
+              continue;
             }
-          );
-          
-          this.addResource(resource);
-          groupCount++;
+            const id = `${proxy}/default/${target.Type}/${target.RdsResourceId}`;
+            this.add('aws_db_proxy_target', id, `${proxy}-${target.RdsResourceId}`, {
+              db_proxy_name: proxy, target_type: target.Type, identifier: target.RdsResourceId
+            });
+          }
+        }
+      }));
+    });
+
+    await this.collect('RDS proxy endpoints', async () => {
+      for await (const page of paginateDescribeDBProxyEndpoints({ client: rds }, {})) {
+        for (const endpoint of page.DBProxyEndpoints || []) {
+          // The default endpoint is part of aws_db_proxy.
+          if (!endpoint.DBProxyName || !endpoint.DBProxyEndpointName || endpoint.IsDefault || endpoint.Status === 'deleting') {
+            continue;
+          }
+          const id = `${endpoint.DBProxyName}/${endpoint.DBProxyEndpointName}`;
+          this.add('aws_db_proxy_endpoint', id, endpoint.DBProxyEndpointName, {
+            db_proxy_name: endpoint.DBProxyName,
+            db_proxy_endpoint_name: endpoint.DBProxyEndpointName,
+            arn: endpoint.DBProxyEndpointArn
+          });
         }
       }
-      
-      this.log(`Loaded ${groupCount} RDS option groups`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS option groups: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadEventSubscriptions(): Promise<void> {
-    try {
-      this.log('Loading RDS event subscriptions...', 'info');
-      
-      const command = new DescribeEventSubscriptionsCommand({});
-      const response = await this.client.send(command);
-      
-      let subscriptionCount = 0;
-      for (const subscription of response.EventSubscriptionsList || []) {
-        if (subscription.CustomerAwsId) {
-          const resource = this.createResource(
-            subscription.CustomerAwsId,
-            subscription.CustomerAwsId,
-            'db_event_subscription',
-            {},
-            {
-              name: subscription.CustSubscriptionId,
-              sns_topic: subscription.SnsTopicArn,
-              source_type: subscription.SourceType,
-              source_ids: subscription.SourceIdsList || [],
-              event_categories: subscription.EventCategoriesList || [],
-              enabled: subscription.Enabled
-            }
-          );
-          
-          this.addResource(resource);
-          subscriptionCount++;
+    await this.collect('RDS global clusters', async () => {
+      for await (const page of paginateDescribeGlobalClusters({ client: rds }, {})) {
+        for (const cluster of page.GlobalClusters || []) {
+          const id = cluster.GlobalClusterIdentifier;
+          if (!id || dbFamily(cluster.Engine) !== 'rds' || cluster.Status === 'deleting'
+            || globalClusterHomeRegion(cluster.GlobalClusterMembers) !== this.region) {
+            continue;
+          }
+          this.add('aws_rds_global_cluster', id, id, {
+            global_cluster_identifier: id, arn: cluster.GlobalClusterArn, engine: cluster.Engine, tags: tagMap(cluster.TagList)
+          });
         }
       }
-      
-      this.log(`Loaded ${subscriptionCount} RDS event subscriptions`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS event subscriptions: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  private async loadGlobalClusters(): Promise<void> {
-    try {
-      this.log('Loading RDS global clusters...', 'info');
-      
-      const command = new DescribeGlobalClustersCommand({});
-      const response = await this.client.send(command);
-      
-      let clusterCount = 0;
-      for (const cluster of response.GlobalClusters || []) {
-        if (cluster.GlobalClusterIdentifier) {
-          const resource = this.createResource(
-            cluster.GlobalClusterIdentifier,
-            cluster.GlobalClusterIdentifier,
-            'rds_global_cluster',
-            {},
-            {
-              global_cluster_identifier: cluster.GlobalClusterIdentifier,
-              engine: cluster.Engine,
-              engine_version: cluster.EngineVersion,
-              database_name: cluster.DatabaseName,
-              deletion_protection: cluster.DeletionProtection,
-              storage_encrypted: cluster.StorageEncrypted
-            }
-          );
-          
-          this.addResource(resource);
-          clusterCount++;
-        }
-      }
-      
-      this.log(`Loaded ${clusterCount} RDS global clusters`, 'info');
-    } catch (error) {
-      this.log(`Error loading RDS global clusters: ${error}`, 'error');
-      throw error;
-    }
+    });
   }
 }
 
+/** Subnet group usages of clusters and instances (instance subnet groups are objects). */
+export function dbUses(
+  clusters: Array<{ DBSubnetGroup?: string; Engine?: string }>,
+  instances: Array<{ DBSubnetGroup?: { DBSubnetGroupName?: string }; Engine?: string }>
+): SubnetGroupUse[] {
+  return [
+    ...clusters.map(cluster => ({ subnetGroup: cluster.DBSubnetGroup, engine: cluster.Engine })),
+    ...instances.map(instance => ({ subnetGroup: instance.DBSubnetGroup?.DBSubnetGroupName, engine: instance.Engine }))
+  ];
+}

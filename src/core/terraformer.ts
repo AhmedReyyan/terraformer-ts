@@ -1,190 +1,271 @@
-import { BaseProvider } from './provider';
+import { BaseProvider, describeError } from './provider';
 import { HclGenerator } from './hcl-generator';
-import { ImportOptions, TerraformResource, Logger, ProgressCallback } from '../types';
+import { applyFilters, parseFilter } from './filter';
+import { NameAllocator } from './naming';
+import { TerraformCli } from './terraform-cli';
+import {
+  ImportOptions,
+  ImportResult,
+  OutputDirectoryResult,
+  ProviderData,
+  ResourceFilter,
+  TerraformResource,
+  Logger,
+  ProgressCallback
+} from '../types';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+
+const DEFAULT_PATH_PATTERN = '{output}/{provider}/{service}/';
+const COMPACT_PATH_PATTERN = '{output}/{provider}/';
+
+interface DiscoveryResult {
+  resources: TerraformResource[];
+  warnings: string[];
+  /** Provider configuration for each scope (region / project / subscription). */
+  providerData: Map<string, ProviderData>;
+}
 
 export class Terraformer {
   private provider: BaseProvider;
   private logger: Logger;
-  private hclGenerator: HclGenerator;
 
   constructor(provider: BaseProvider, logger: Logger) {
     this.provider = provider;
     this.logger = logger;
-    this.hclGenerator = new HclGenerator('hcl', true);
   }
 
-  async import(options: ImportOptions, progressCallback?: ProgressCallback): Promise<void> {
-    try {
-      this.logger.info(`Starting import for provider: ${this.provider.getName()}`);
-      
-      // Initialize provider
-      await this.provider.init([]);
-      
-      const allResources: TerraformResource[] = [];
-      const supportedServices = this.provider.getSupportedServices();
-      
-      // Filter services based on options
-      const servicesToImport = this.filterServices(options.resources, Object.keys(supportedServices), options.excludes);
-      
-      this.logger.info(`Importing services: ${servicesToImport.join(', ')}`);
-      
-      // Import each service
-      for (let i = 0; i < servicesToImport.length; i++) {
-        const serviceName = servicesToImport[i];
-        
-        if (progressCallback) {
-          progressCallback(`Importing ${serviceName}...`, i + 1, servicesToImport.length);
+  /**
+   * Discover resources, write provider + import blocks for each output directory and,
+   * when Terraform is available, generate the resource configuration with
+   * `terraform plan -generate-config-out`.
+   */
+  async import(options: ImportOptions, progressCallback?: ProgressCallback): Promise<ImportResult> {
+    this.logger.info(`Starting import for provider: ${this.provider.getName()}`);
+
+    const discovery = await this.discover(options, progressCallback);
+    const warnings = [...discovery.warnings];
+    const directories = await this.writeDirectories(discovery, options);
+
+    if (directories.length > 0 && options.generate !== false) {
+      await this.generateConfiguration(directories, options, warnings, progressCallback);
+    }
+
+    this.logger.info(`Import completed. Total resources: ${discovery.resources.length}`);
+    return { resources: discovery.resources, directories: directories.map(d => d.result), warnings };
+  }
+
+  /** Discover resources and write them to plan.json without generating any Terraform files. */
+  async plan(options: ImportOptions, progressCallback?: ProgressCallback): Promise<ImportResult> {
+    this.logger.info(`Generating plan for provider: ${this.provider.getName()}`);
+    const discovery = await this.discover(options, progressCallback);
+
+    const outputPath = options.pathOutput || 'generated';
+    const planPath = path.join(outputPath, this.provider.getName(), 'plan.json');
+    const planData = {
+      version: '2.0.0',
+      provider: this.provider.getName(),
+      options,
+      importedResources: groupBy(discovery.resources, r => r.service || 'unknown'),
+      warnings: discovery.warnings
+    };
+
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, JSON.stringify(planData, null, 2), 'utf8');
+
+    this.logger.info(`Plan saved to: ${planPath}`);
+    return { resources: discovery.resources, directories: [], warnings: discovery.warnings };
+  }
+
+  async discover(options: ImportOptions, progressCallback?: ProgressCallback): Promise<DiscoveryResult> {
+    const warnings: string[] = [];
+    const resources: TerraformResource[] = [];
+    const providerData = new Map<string, ProviderData>();
+
+    const services = this.selectServices(options.resources, options.excludes, warnings);
+    const filters = this.parseFilters(options.filters);
+    const scopes = this.getScopes(options);
+
+    this.logger.info(`Importing services: ${services.join(', ') || '(none)'}`);
+
+    const total = scopes.length * services.length;
+    let step = 0;
+
+    for (const [scopeIndex, scope] of scopes.entries()) {
+      await this.provider.init(scope === undefined ? [] : [scope]);
+      const scopeName = this.provider.getScope();
+      providerData.set(scopeName, this.provider.getProviderData());
+
+      for (const serviceName of services) {
+        step++;
+        if (scopeIndex > 0 && this.provider.isGlobalService(serviceName)) {
+          continue;
         }
-        
+        progressCallback?.(`Importing ${serviceName} (${scopeName})...`, step, total);
+
         try {
           const service = await this.provider.initService(serviceName, options.verbose || false);
           await service.initResources();
-          
-          // Apply filters
-          if (options.filters && options.filters.length > 0) {
-            this.applyFilters(service, options.filters);
-          }
-          
-          // Run post-conversion hook
           await service.postConvertHook();
-          
-          const serviceResources = service.getResources();
-          allResources.push(...serviceResources);
-          
-          this.logger.info(`Imported ${serviceResources.length} resources from ${serviceName}`);
+
+          const found = service.getResources().map(resource => ({
+            ...resource,
+            service: resource.service || serviceName,
+            region: scopeName
+          }));
+          const kept = applyFilters(found, filters);
+          resources.push(...kept);
+          warnings.push(...service.getWarnings());
+
+          const filtered = found.length - kept.length;
+          this.logger.info(
+            `Found ${kept.length} resources in ${serviceName} (${scopeName})` +
+            (filtered > 0 ? `, ${filtered} excluded by filters` : '')
+          );
         } catch (error) {
-          this.logger.error(`Error importing ${serviceName}: ${error}`);
-          if (options.verbose) {
-            throw error;
-          }
+          const message = `[${this.provider.getName()}:${serviceName}] failed in ${scopeName}: ${describeError(error)}`;
+          warnings.push(message);
+          this.logger.error(message);
         }
       }
-      
-      // Generate output files
-      await this.generateOutput(allResources, options);
-      
-      this.logger.info(`Import completed. Total resources: ${allResources.length}`);
-      
-    } catch (error) {
-      this.logger.error(`Import failed: ${error}`);
-      throw error;
     }
+
+    return { resources, warnings, providerData };
   }
 
-  async plan(options: ImportOptions): Promise<ImportOptions> {
-    this.logger.info(`Generating plan for provider: ${this.provider.getName()}`);
-    
-    // This would generate a plan file that can be reviewed before import
-    const planData = {
-      version: '1.0.0',
-      provider: this.provider.getName(),
-      options,
-      args: [],
-      importedResources: {}
-    };
-    
-    const outputPath = options.pathOutput || 'generated';
-    const planPath = path.join(outputPath, this.provider.getName(), 'plan.json');
-    
-    await fs.mkdir(path.dirname(planPath), { recursive: true });
-    await fs.writeFile(planPath, JSON.stringify(planData, null, 2));
-    
-    this.logger.info(`Plan saved to: ${planPath}`);
-    return options;
-  }
+  private async writeDirectories(
+    discovery: DiscoveryResult,
+    options: ImportOptions
+  ): Promise<Array<{ resources: TerraformResource[]; result: OutputDirectoryResult }>> {
+    const pathPattern = this.getPathPattern(options);
+    const generator = new HclGenerator(options.output || 'hcl', !options.noSort);
 
-  private filterServices(
-    requestedResources: string[], 
-    availableServices: string[], 
-    excludes?: string[]
-  ): string[] {
-    let services = availableServices;
-    
-    // If specific resources are requested
-    if (requestedResources.length > 0 && !requestedResources.includes('*')) {
-      services = availableServices.filter(service => 
-        requestedResources.includes(service)
-      );
-    }
-    
-    // Apply excludes
-    if (excludes && excludes.length > 0) {
-      services = services.filter(service => 
-        !excludes.includes(service)
-      );
-    }
-    
-    return services;
-  }
-
-  private applyFilters(service: any, filters: string[]): void {
-    // This would apply the filters to the service resources
-    // Implementation depends on the specific filter logic
-    for (const filter of filters) {
-      const parsedFilters = service.parseFilter(filter);
-      // Apply filters to resources
-    }
-  }
-
-  private async generateOutput(resources: TerraformResource[], options: ImportOptions): Promise<void> {
-    const outputPath = options.pathOutput || 'generated';
-    const pathPattern = options.pathPattern || '{output}/{provider}/{service}/';
-    const isCompact = options.compact || false;
-    const outputFormat = options.output || 'hcl';
-    
-    // Generate provider data
-    const providerData = this.provider.getProviderData();
-    
-    // Group resources by service
-    const resourcesByService = this.groupResourcesByService(resources);
-    
-    // Generate files for each service
-    for (const [serviceName, serviceResources] of Object.entries(resourcesByService)) {
-      const serviceOutputPath = this.resolvePathPattern(pathPattern, {
-        output: outputPath,
+    const byDirectory = new Map<string, { scope: string; resources: TerraformResource[] }>();
+    for (const resource of discovery.resources) {
+      const directory = path.normalize(resolvePathPattern(pathPattern, {
+        output: options.pathOutput || 'generated',
         provider: this.provider.getName(),
-        service: serviceName
-      });
-      
-      // Generate HCL/JSON files
-      const hclGenerator = new HclGenerator(outputFormat as 'hcl' | 'json', !options.noSort);
-      await hclGenerator.generateFiles(
-        serviceResources,
-        providerData,
-        serviceOutputPath,
-        serviceName,
-        isCompact
-      );
-      
-      // Generate Terraform state
-      await hclGenerator.generateTerraformState(serviceResources, serviceOutputPath);
-      
-      this.logger.info(`Generated files for ${serviceName} in ${serviceOutputPath}`);
-    }
-  }
-
-  private groupResourcesByService(resources: TerraformResource[]): Record<string, TerraformResource[]> {
-    const grouped: Record<string, TerraformResource[]> = {};
-    
-    for (const resource of resources) {
-      const serviceName = resource.type.replace(`${resource.provider}_`, '');
-      if (!grouped[serviceName]) {
-        grouped[serviceName] = [];
+        service: resource.service || 'resources',
+        region: resource.region || this.provider.getScope()
+      }));
+      if (!byDirectory.has(directory)) {
+        byDirectory.set(directory, { scope: resource.region || this.provider.getScope(), resources: [] });
       }
-      grouped[serviceName].push(resource);
+      byDirectory.get(directory)!.resources.push(resource);
     }
-    
-    return grouped;
+
+    const written: Array<{ resources: TerraformResource[]; result: OutputDirectoryResult }> = [];
+    for (const [directory, group] of byDirectory) {
+      const resources = assignUniqueNames(dedupe(group.resources));
+      const providerData = discovery.providerData.get(group.scope) || this.provider.getProviderData();
+      await generator.generateFiles(resources, providerData, directory);
+      this.logger.info(`Wrote ${resources.length} import blocks to ${directory}`);
+      written.push({
+        resources,
+        result: { path: directory, resourceCount: resources.length, generation: 'skipped' }
+      });
+    }
+    return written;
   }
 
-  private resolvePathPattern(pattern: string, variables: Record<string, string>): string {
-    let resolved = pattern;
-    for (const [key, value] of Object.entries(variables)) {
-      resolved = resolved.replace(`{${key}}`, value);
+  private async generateConfiguration(
+    directories: Array<{ result: OutputDirectoryResult }>,
+    options: ImportOptions,
+    warnings: string[],
+    progressCallback?: ProgressCallback
+  ): Promise<void> {
+    const cli = new TerraformCli(options.terraformBin || 'terraform', this.provider.getTerraformEnv());
+    const version = await cli.detectVersion();
+
+    if (!version) {
+      const message = 'Terraform >= 1.5 was not found, so only import blocks were written. ' +
+        'Install Terraform (or pass --terraform-bin) and run ' +
+        '"terraform init && terraform plan -generate-config-out=generated.tf" in each output directory.';
+      if (options.generate === true) {
+        warnings.push(message);
+      }
+      this.logger.warn(message);
+      for (const directory of directories) {
+        directory.result.message = 'terraform not available';
+      }
+      return;
     }
-    return resolved;
+
+    this.logger.info(`Generating resource configuration with Terraform ${version}`);
+    const pluginCache = path.resolve(options.pathOutput || 'generated', '.terraform-plugin-cache');
+
+    // Sequential on purpose: the shared plugin cache is not safe for concurrent `terraform init`.
+    for (const [index, directory] of directories.entries()) {
+      progressCallback?.(`Generating configuration in ${directory.result.path}...`, index + 1, directories.length);
+      try {
+        const result = await cli.generateConfig(directory.result.path, pluginCache);
+        directory.result.generation = result.success ? 'succeeded' : 'failed';
+        directory.result.message = result.message;
+        if (!result.success) {
+          warnings.push(`${directory.result.path}: ${result.message}`);
+          this.logger.warn(`${directory.result.path}: ${result.message}`);
+        }
+      } catch (error) {
+        directory.result.generation = 'failed';
+        directory.result.message = describeError(error);
+        warnings.push(`${directory.result.path}: ${describeError(error)}`);
+        this.logger.warn(`${directory.result.path}: ${describeError(error)}`);
+      }
+    }
+  }
+
+  private selectServices(requested: string[], excludes: string[] = [], warnings: string[]): string[] {
+    const supported = this.provider.getSupportedServices();
+    const available = Object.keys(supported);
+    const wanted = requested.map(r => r.trim()).filter(Boolean);
+    let services: string[];
+
+    if (wanted.length === 0 || wanted.includes('*')) {
+      // Several names can point at the same service (aliases); import each service once.
+      const seen = new Set<unknown>();
+      services = available.filter(name => {
+        if (seen.has(supported[name])) {
+          return false;
+        }
+        seen.add(supported[name]);
+        return true;
+      });
+    } else {
+      for (const name of wanted) {
+        if (!available.includes(name)) {
+          const message = `[${this.provider.getName()}] unknown service "${name}" (run "terraformer list ${this.provider.getName()}")`;
+          warnings.push(message);
+          this.logger.warn(message);
+        }
+      }
+      services = [...new Set(wanted)].filter(name => available.includes(name));
+    }
+
+    const excluded = new Set(excludes.map(e => e.trim()));
+    return services.filter(service => !excluded.has(service));
+  }
+
+  private parseFilters(rawFilters: string[] = []): ResourceFilter[] {
+    return rawFilters.flatMap(filter => parseFilter(filter));
+  }
+
+  private getScopes(options: ImportOptions): Array<string | undefined> {
+    const scopes = options.regions?.length ? options.regions
+      : options.projects?.length ? options.projects
+        : options.region ? [options.region] : [];
+    const unique = [...new Set(scopes.map(s => s.trim()).filter(Boolean))];
+    return unique.length > 0 ? unique : [undefined];
+  }
+
+  private getPathPattern(options: ImportOptions): string {
+    let pattern = options.pathPattern || (options.compact ? COMPACT_PATH_PATTERN : DEFAULT_PATH_PATTERN);
+    // Every directory needs a single provider configuration, so separate scopes.
+    if (this.getScopes(options).length > 1 && !pattern.includes('{region}')) {
+      pattern = pattern.includes('{provider}')
+        ? pattern.replace('{provider}', '{provider}/{region}')
+        : path.join(pattern, '{region}');
+    }
+    return pattern;
   }
 
   getSupportedServices(): string[] {
@@ -196,4 +277,36 @@ export class Terraformer {
   }
 }
 
+function resolvePathPattern(pattern: string, variables: Record<string, string>): string {
+  let resolved = pattern;
+  for (const [key, value] of Object.entries(variables)) {
+    resolved = resolved.split(`{${key}}`).join(value);
+  }
+  return resolved;
+}
 
+/** The same object can be found twice (e.g. through two service aliases). */
+function dedupe(resources: TerraformResource[]): TerraformResource[] {
+  const seen = new Set<string>();
+  return resources.filter(resource => {
+    const key = `${resource.type}\u0000${resource.id}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function assignUniqueNames(resources: TerraformResource[]): TerraformResource[] {
+  const allocator = new NameAllocator();
+  return resources.map(resource => ({ ...resource, name: allocator.allocate(resource.type, resource.name) }));
+}
+
+function groupBy<T>(items: T[], key: (item: T) => string): Record<string, T[]> {
+  const grouped: Record<string, T[]> = {};
+  for (const item of items) {
+    (grouped[key(item)] ||= []).push(item);
+  }
+  return grouped;
+}

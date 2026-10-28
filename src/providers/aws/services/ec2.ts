@@ -1,294 +1,174 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
-import { EC2Client, DescribeInstancesCommand, DescribeVpcsCommand, DescribeSubnetsCommand, DescribeSecurityGroupsCommand } from '@aws-sdk/client-ec2';
-import { fromIni } from '@aws-sdk/credential-providers';
+import {
+  EC2Client,
+  Tag,
+  paginateDescribeInstances,
+  paginateDescribeVolumes,
+  paginateDescribeLaunchTemplates,
+  paginateDescribeImages,
+  paginateDescribeNetworkInterfaces,
+  DescribeKeyPairsCommand,
+  DescribeAddressesCommand,
+  DescribePlacementGroupsCommand
+} from '@aws-sdk/client-ec2';
+import { AwsService, tagMap, nameTag } from '../aws-service';
 
-export class EC2Service extends BaseService {
-  private client: EC2Client;
+/**
+ * Tags marking an instance as owned by another service: Auto Scaling, EC2/Spot Fleet and Karpenter
+ * replace these instances themselves, so they are managed through their group/fleet, not aws_instance.
+ */
+const OWNER_TAGS = ['aws:autoscaling:groupName', 'aws:ec2spot:fleet-request-id', 'aws:ec2:fleet-id', 'karpenter.sh/nodepool'];
 
-  constructor(providerName: string, serviceName: string, config: ProviderConfig, logger: Logger) {
-    super(providerName, serviceName, config, logger);
-    this.client = new EC2Client({
-      region: config.region || 'us-east-1',
-      credentials: config.credentials ? {
-        accessKeyId: config.credentials.accessKeyId || '',
-        secretAccessKey: config.credentials.secretAccessKey || '',
-        sessionToken: config.credentials.sessionToken || undefined
-      } : undefined // Let AWS SDK use environment variables
-    });
-  }
+/** ENI types a user creates; the others (lambda, nat_gateway, vpc_endpoint, load_balancer, ...) belong to AWS services. */
+const USER_ENI_TYPES = new Set(['interface', 'efa', 'efa-only']);
 
+function hasTag(tags: Tag[] | undefined, keys: string[]): boolean {
+  return Boolean(tags?.some(tag => tag.Key !== undefined && keys.includes(tag.Key)));
+}
+
+export class EC2Service extends AwsService {
   async initResources(): Promise<void> {
-    await this.loadInstances();
-    await this.loadVpcs();
-    await this.loadSubnets();
-    await this.loadSecurityGroups();
-  }
+    const ec2 = this.client(EC2Client);
+    // Instances that are not imported (other owners); their secondary ENIs are skipped too.
+    const skippedInstances = new Set<string>();
 
-  private async loadInstances(): Promise<void> {
-    try {
-      this.log('Loading EC2 instances...', 'info');
-      
-      const command = new DescribeInstancesCommand({});
-      const response = await this.client.send(command);
-      
-      let instanceCount = 0;
-      for (const reservation of response.Reservations || []) {
-        for (const instance of reservation.Instances || []) {
-          if (instance.InstanceId && instance.State?.Name !== 'terminated') {
-            const resource = this.createResource(
-              instance.InstanceId,
-              this.generateInstanceName(instance),
-              'instance',
-              this.mapInstanceAttributes(instance),
-              {
-                tags: instance.Tags || []
-              }
-            );
-            
-            this.addResource(resource);
-            instanceCount++;
+    await this.collect('EC2 instances', async () => {
+      for await (const page of paginateDescribeInstances({ client: ec2 }, {})) {
+        for (const reservation of page.Reservations || []) {
+          for (const instance of reservation.Instances || []) {
+            const id = instance.InstanceId;
+            const state = instance.State?.Name;
+            if (!id || state === 'terminated' || state === 'shutting-down') {
+              continue;
+            }
+            if (hasTag(instance.Tags, OWNER_TAGS) || instance.Operator?.Managed) {
+              skippedInstances.add(id);
+              continue;
+            }
+            this.add('aws_instance', id, nameTag(instance.Tags, id), {
+              id,
+              instance_type: instance.InstanceType,
+              tags: tagMap(instance.Tags)
+            });
           }
         }
       }
-      
-      this.log(`Loaded ${instanceCount} EC2 instances`, 'info');
-    } catch (error) {
-      this.log(`Error loading EC2 instances: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadVpcs(): Promise<void> {
-    try {
-      this.log('Loading VPCs...', 'info');
-      
-      const command = new DescribeVpcsCommand({});
-      const response = await this.client.send(command);
-      
-      let vpcCount = 0;
-      for (const vpc of response.Vpcs || []) {
-        if (vpc.VpcId) {
-          const resource = this.createResource(
-            vpc.VpcId,
-            this.generateVpcName(vpc),
-            'vpc',
-            this.mapVpcAttributes(vpc),
-            {
-              tags: vpc.Tags || []
-            }
-          );
-          
-          this.addResource(resource);
-          vpcCount++;
+    await this.collect('EBS volumes', async () => {
+      for await (const page of paginateDescribeVolumes({ client: ec2 }, {})) {
+        for (const volume of page.Volumes || []) {
+          // Only unattached volumes: aws_instance reads every attached volume into its inline
+          // root_block_device / ebs_block_device blocks, and the docs forbid mixing those with
+          // aws_ebs_volume + aws_volume_attachment for the same instance.
+          if (!volume.VolumeId || volume.State !== 'available' || volume.Operator?.Managed) {
+            continue;
+          }
+          this.add('aws_ebs_volume', volume.VolumeId, nameTag(volume.Tags, volume.VolumeId), {
+            id: volume.VolumeId,
+            tags: tagMap(volume.Tags)
+          });
         }
       }
-      
-      this.log(`Loaded ${vpcCount} VPCs`, 'info');
-    } catch (error) {
-      this.log(`Error loading VPCs: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadSubnets(): Promise<void> {
-    try {
-      this.log('Loading subnets...', 'info');
-      
-      const command = new DescribeSubnetsCommand({});
-      const response = await this.client.send(command);
-      
-      let subnetCount = 0;
-      for (const subnet of response.Subnets || []) {
-        if (subnet.SubnetId) {
-          const resource = this.createResource(
-            subnet.SubnetId,
-            this.generateSubnetName(subnet),
-            'subnet',
-            this.mapSubnetAttributes(subnet),
-            {
-              tags: subnet.Tags || []
-            }
-          );
-          
-          this.addResource(resource);
-          subnetCount++;
+    await this.collect('key pairs', async () => {
+      const response = await ec2.send(new DescribeKeyPairsCommand({}));
+      for (const key of response.KeyPairs || []) {
+        if (key.KeyName) {
+          this.add('aws_key_pair', key.KeyName, key.KeyName, {
+            name: key.KeyName,
+            id: key.KeyPairId,
+            tags: tagMap(key.Tags)
+          });
         }
       }
-      
-      this.log(`Loaded ${subnetCount} subnets`, 'info');
-    } catch (error) {
-      this.log(`Error loading subnets: ${error}`, 'error');
-      throw error;
-    }
-  }
+    });
 
-  private async loadSecurityGroups(): Promise<void> {
-    try {
-      this.log('Loading security groups...', 'info');
-      
-      const command = new DescribeSecurityGroupsCommand({});
-      const response = await this.client.send(command);
-      
-      let sgCount = 0;
-      for (const sg of response.SecurityGroups || []) {
-        if (sg.GroupId) {
-          const resource = this.createResource(
-            sg.GroupId,
-            this.generateSecurityGroupName(sg),
-            'security_group',
-            this.mapSecurityGroupAttributes(sg),
-            {
-              tags: sg.Tags || []
-            }
-          );
-          
-          this.addResource(resource);
-          sgCount++;
+    await this.collect('Elastic IPs', async () => {
+      const response = await ec2.send(new DescribeAddressesCommand({}));
+      for (const address of response.Addresses || []) {
+        // EC2-Classic addresses have no allocation ID; service-managed EIPs (ALB/NLB/RNAT) belong to that service.
+        if (!address.AllocationId || address.ServiceManaged) {
+          continue;
         }
-      }
-      
-      this.log(`Loaded ${sgCount} security groups`, 'info');
-    } catch (error) {
-      this.log(`Error loading security groups: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    const filters: ResourceFilter[] = [];
-    
-    if (!rawFilter.includes('Name=') && rawFilter.includes('=')) {
-      // Simple ID-based filter: resource=id1:id2:id3
-      const [serviceName, resourcesId] = rawFilter.split('=');
-      filters.push({
-        serviceName,
-        fieldPath: 'id',
-        acceptableValues: resourcesId.split(':'),
-        isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-      });
-    } else {
-      // Complex filter: Type=instance;Name=instance_type;Value=t3.micro
-      const parts = rawFilter.split(';');
-      if (parts.length >= 1) {
-        const serviceName = parts[0].startsWith('Type=') ? parts[0].substring(5) : '';
-        const fieldPath = parts[1]?.startsWith('Name=') ? parts[1].substring(5) : parts[0];
-        const acceptableValues = parts[2]?.startsWith('Value=') ? 
-          parts[2].substring(6).split(':') : undefined;
-
-        filters.push({
-          serviceName,
-          fieldPath,
-          acceptableValues: acceptableValues || [],
-          isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
+        this.add('aws_eip', address.AllocationId, nameTag(address.Tags, address.PublicIp || address.AllocationId), {
+          id: address.AllocationId,
+          public_ip: address.PublicIp,
+          tags: tagMap(address.Tags)
         });
       }
-    }
+    });
 
-    return filters;
-  }
-
-  async postConvertHook(): Promise<void> {
-    // Post-processing hook for EC2 resources
-    this.log('Running EC2 post-conversion hook...', 'debug');
-  }
-
-  private generateInstanceName(instance: any): string {
-    const nameTag = instance.Tags?.find((tag: any) => tag.Key === 'Name')?.Value;
-    return nameTag || `instance-${instance.InstanceId}`;
-  }
-
-  private generateVpcName(vpc: any): string {
-    const nameTag = vpc.Tags?.find((tag: any) => tag.Key === 'Name')?.Value;
-    return nameTag || `vpc-${vpc.VpcId}`;
-  }
-
-  private generateSubnetName(subnet: any): string {
-    const nameTag = subnet.Tags?.find((tag: any) => tag.Key === 'Name')?.Value;
-    return nameTag || `subnet-${subnet.SubnetId}`;
-  }
-
-  private generateSecurityGroupName(sg: any): string {
-    const nameTag = sg.Tags?.find((tag: any) => tag.Key === 'Name')?.Value;
-    return nameTag || sg.GroupName || `sg-${sg.GroupId}`;
-  }
-
-  private mapInstanceAttributes(instance: any): Record<string, any> {
-    return {
-      instance_type: instance.InstanceType,
-      ami: instance.ImageId,
-      availability_zone: instance.Placement?.AvailabilityZone,
-      subnet_id: instance.SubnetId,
-      vpc_security_group_ids: instance.SecurityGroups?.map((sg: any) => sg.GroupId) || [],
-      key_name: instance.KeyName,
-      monitoring: instance.Monitoring?.State === 'enabled',
-      ebs_optimized: instance.EbsOptimized,
-      disable_api_termination: instance.DisableApiTermination,
-      instance_initiated_shutdown_behavior: instance.InstanceInitiatedShutdownBehavior,
-      private_ip: instance.PrivateIpAddress,
-      public_ip: instance.PublicIpAddress,
-      associate_public_ip_address: instance.PublicIpAddress ? true : false,
-      tenancy: instance.Placement?.Tenancy,
-      host_id: instance.Placement?.HostId,
-      cpu_core_count: instance.CpuOptions?.CoreCount,
-      cpu_threads_per_core: instance.CpuOptions?.ThreadsPerCore,
-      hibernation: instance.HibernationOptions?.Configured || false,
-      enclave_options: instance.EnclaveOptions?.Enabled || false,
-      metadata_options: {
-        http_endpoint: instance.MetadataOptions?.HttpEndpoint,
-        http_tokens: instance.MetadataOptions?.HttpTokens,
-        http_put_response_hop_limit: instance.MetadataOptions?.HttpPutResponseHopLimit
+    await this.collect('launch templates', async () => {
+      for await (const page of paginateDescribeLaunchTemplates({ client: ec2 }, {})) {
+        for (const template of page.LaunchTemplates || []) {
+          // Launch templates created by EKS managed node groups (or service operators) are owned by them.
+          if (!template.LaunchTemplateId || hasTag(template.Tags, ['eks:nodegroup-name']) || template.Operator?.Managed) {
+            continue;
+          }
+          this.add('aws_launch_template', template.LaunchTemplateId, template.LaunchTemplateName || template.LaunchTemplateId, {
+            id: template.LaunchTemplateId,
+            name: template.LaunchTemplateName,
+            tags: tagMap(template.Tags)
+          });
+        }
       }
-    };
-  }
+    });
 
-  private mapVpcAttributes(vpc: any): Record<string, any> {
-    return {
-      cidr_block: vpc.CidrBlock,
-      instance_tenancy: vpc.InstanceTenancy,
-      enable_dns_hostnames: vpc.DnsOptions?.DnsHostnames?.Value,
-      enable_dns_support: vpc.DnsOptions?.DnsSupport?.Value,
-      enable_classiclink: vpc.ClassicLinkEnabled,
-      enable_classiclink_dns_support: vpc.ClassicLinkDnsSupported,
-      assign_generated_ipv6_cidr_block: vpc.Ipv6CidrBlockAssociationSet?.length > 0
-    };
-  }
+    await this.collect('AMIs', async () => {
+      for await (const page of paginateDescribeImages({ client: ec2 }, { Owners: ['self'] })) {
+        for (const image of page.Images || []) {
+          // Skip pending/failed/deregistered images.
+          if (!image.ImageId || (image.State !== 'available' && image.State !== 'disabled')) {
+            continue;
+          }
+          this.add('aws_ami', image.ImageId, image.Name || image.ImageId, {
+            id: image.ImageId,
+            name: image.Name,
+            tags: tagMap(image.Tags)
+          });
+        }
+      }
+    });
 
-  private mapSubnetAttributes(subnet: any): Record<string, any> {
-    return {
-      vpc_id: subnet.VpcId,
-      cidr_block: subnet.CidrBlock,
-      availability_zone: subnet.AvailabilityZone,
-      availability_zone_id: subnet.AvailabilityZoneId,
-      map_public_ip_on_launch: subnet.MapPublicIpOnLaunch,
-      assign_ipv6_address_on_creation: subnet.AssignIpv6AddressOnCreation,
-      ipv6_cidr_block: subnet.Ipv6CidrBlockAssociationSet?.[0]?.Ipv6CidrBlock
-    };
-  }
+    await this.collect('placement groups', async () => {
+      const response = await ec2.send(new DescribePlacementGroupsCommand({}));
+      for (const group of response.PlacementGroups || []) {
+        if (!group.GroupName || group.State === 'deleting' || group.State === 'deleted' || group.Operator?.Managed) {
+          continue;
+        }
+        this.add('aws_placement_group', group.GroupName, group.GroupName, {
+          name: group.GroupName,
+          id: group.GroupId,
+          strategy: group.Strategy,
+          tags: tagMap(group.Tags)
+        });
+      }
+    });
 
-  private mapSecurityGroupAttributes(sg: any): Record<string, any> {
-    return {
-      name: sg.GroupName,
-      description: sg.Description,
-      vpc_id: sg.VpcId,
-      ingress: sg.IpPermissions?.map((rule: any) => ({
-        from_port: rule.FromPort,
-        to_port: rule.ToPort,
-        protocol: rule.IpProtocol,
-        cidr_blocks: rule.IpRanges?.map((ip: any) => ip.CidrIp) || [],
-        ipv6_cidr_blocks: rule.Ipv6Ranges?.map((ip: any) => ip.CidrIpv6) || [],
-        security_groups: rule.UserIdGroupPairs?.map((group: any) => group.GroupId) || [],
-        self: rule.UserIdGroupPairs?.some((group: any) => group.UserId === sg.OwnerId) || false
-      })) || [],
-      egress: sg.IpPermissionsEgress?.map((rule: any) => ({
-        from_port: rule.FromPort,
-        to_port: rule.ToPort,
-        protocol: rule.IpProtocol,
-        cidr_blocks: rule.IpRanges?.map((ip: any) => ip.CidrIp) || [],
-        ipv6_cidr_blocks: rule.Ipv6Ranges?.map((ip: any) => ip.CidrIpv6) || [],
-        security_groups: rule.UserIdGroupPairs?.map((group: any) => group.GroupId) || [],
-        self: rule.UserIdGroupPairs?.some((group: any) => group.UserId === sg.OwnerId) || false
-      })) || []
-    };
+    await this.collect('network interfaces', async () => {
+      for await (const page of paginateDescribeNetworkInterfaces({ client: ec2 }, {})) {
+        for (const eni of page.NetworkInterfaces || []) {
+          const id = eni.NetworkInterfaceId;
+          const attachment = eni.Attachment;
+          if (
+            !id ||
+            eni.RequesterManaged ||
+            eni.Operator?.Managed ||
+            !USER_ENI_TYPES.has(eni.InterfaceType || 'interface') ||
+            // The primary ENI is created with the instance and lives in aws_instance.primary_network_interface.
+            attachment?.DeviceIndex === 0 ||
+            (attachment?.InstanceId && skippedInstances.has(attachment.InstanceId))
+          ) {
+            continue;
+          }
+          this.add('aws_network_interface', id, nameTag(eni.TagSet, eni.Description || id), {
+            id,
+            subnet_id: eni.SubnetId,
+            tags: tagMap(eni.TagSet)
+          });
+        }
+      }
+    });
   }
 }

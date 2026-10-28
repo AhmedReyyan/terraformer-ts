@@ -1,143 +1,40 @@
-import { BaseService } from '../../../core/provider';
-import { TerraformResource, ResourceFilter, ProviderConfig, Logger } from '../../../types';
-import { SNSClient, ListTopicsCommand, ListSubscriptionsByTopicCommand } from '@aws-sdk/client-sns';
+import { SNSClient, paginateListTopics, paginateListSubscriptions } from '@aws-sdk/client-sns';
+import { AwsService, arnResourceName } from '../aws-service';
 
-export class SNSService extends BaseService {
-  private client: SNSClient;
+/** Subscription "ARNs" that are placeholders, not real subscriptions. */
+const NON_IMPORTABLE_SUBSCRIPTIONS = new Set(['PendingConfirmation', 'Deleted']);
 
-  constructor(providerName: string, serviceName: string, config: ProviderConfig, logger: Logger) {
-    super(providerName, serviceName, config, logger);
-    this.client = new SNSClient({
-      region: config.region || 'us-east-1',
-      credentials: config.credentials ? {
-        accessKeyId: config.credentials.accessKeyId || '',
-        secretAccessKey: config.credentials.secretAccessKey || '',
-        sessionToken: config.credentials.sessionToken || undefined
-      } : undefined
+export class SNSService extends AwsService {
+  async initResources(): Promise<void> {
+    const sns = this.client(SNSClient);
+
+    await this.collect('SNS topics', async () => {
+      for await (const page of paginateListTopics({ client: sns }, {})) {
+        for (const topic of page.Topics || []) {
+          // The topic policy is the `policy` argument of aws_sns_topic, so aws_sns_topic_policy is not imported separately.
+          const arn = topic.TopicArn!;
+          const name = arnResourceName(arn);
+          this.add('aws_sns_topic', arn, name, { name, arn });
+        }
+      }
+    });
+
+    await this.collect('SNS subscriptions', async () => {
+      for await (const page of paginateListSubscriptions({ client: sns }, {})) {
+        for (const subscription of page.Subscriptions || []) {
+          const arn = subscription.SubscriptionArn;
+          // Unconfirmed subscriptions have no ARN yet and cannot be imported.
+          if (!arn || NON_IMPORTABLE_SUBSCRIPTIONS.has(arn)) {
+            continue;
+          }
+          const topicName = arnResourceName(subscription.TopicArn || '');
+          this.add('aws_sns_topic_subscription', arn, `${topicName}_${subscription.Protocol}`, {
+            arn,
+            topic_arn: subscription.TopicArn,
+            protocol: subscription.Protocol
+          });
+        }
+      }
     });
   }
-
-  async initResources(): Promise<void> {
-    await this.loadTopics();
-  }
-
-  private async loadTopics(): Promise<void> {
-    try {
-      this.log('Loading SNS topics...', 'info');
-      
-      const command = new ListTopicsCommand({});
-      const response = await this.client.send(command);
-      
-      let topicCount = 0;
-      for (const topic of response.Topics || []) {
-        if (topic.TopicArn) {
-          const topicName = topic.TopicArn.split(':').pop() || topic.TopicArn;
-          
-          const resource = this.createResource(
-            topic.TopicArn,
-            topicName,
-            'sns_topic',
-            {
-              name: topicName
-            },
-            {
-              arn: topic.TopicArn,
-              name: topicName
-            }
-          );
-          
-          this.addResource(resource);
-          topicCount++;
-          
-          // Load subscriptions for this topic
-          await this.loadSubscriptions(topic.TopicArn);
-        }
-      }
-      
-      this.log(`Loaded ${topicCount} SNS topics`, 'info');
-    } catch (error) {
-      this.log(`Error loading SNS topics: ${error}`, 'error');
-      throw error;
-    }
-  }
-
-  private async loadSubscriptions(topicArn: string): Promise<void> {
-    try {
-      const command = new ListSubscriptionsByTopicCommand({ TopicArn: topicArn });
-      const response = await this.client.send(command);
-      
-      for (const subscription of response.Subscriptions || []) {
-        if (subscription.SubscriptionArn && subscription.SubscriptionArn !== 'PendingConfirmation') {
-          const resource = this.createResource(
-            subscription.SubscriptionArn,
-            subscription.SubscriptionArn,
-            'sns_topic_subscription',
-            {
-              topic_arn: topicArn,
-              protocol: subscription.Protocol,
-              endpoint: subscription.Endpoint
-            },
-            {
-              arn: subscription.SubscriptionArn,
-              owner: subscription.Owner
-            }
-          );
-          
-          this.addResource(resource);
-        }
-      }
-    } catch (error) {
-      this.log(`Error loading subscriptions for topic ${topicArn}: ${error}`, 'debug');
-    }
-  }
-
-  parseFilter(rawFilter: string): ResourceFilter[] {
-    const filters: ResourceFilter[] = [];
-    
-    if (!rawFilter.includes('Name=') && rawFilter.includes('=')) {
-      const [serviceName, resourcesId] = rawFilter.split('=');
-      filters.push({
-        serviceName,
-        fieldPath: 'id',
-        acceptableValues: resourcesId.split(':'),
-        isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-      });
-    } else {
-      const parts = rawFilter.split(';');
-      if (parts.length >= 1) {
-        const serviceName = parts[0].startsWith('Type=') ? parts[0].substring(5) : '';
-        const fieldPath = parts[1]?.startsWith('Name=') ? parts[1].substring(5) : parts[0];
-        const acceptableValues = parts[2]?.startsWith('Value=') ? 
-          parts[2].substring(6).split(':') : undefined;
-
-        filters.push({
-          serviceName,
-          fieldPath,
-          acceptableValues: acceptableValues || [],
-          isApplicable: (resourceName: string) => serviceName === '' || serviceName === resourceName
-        });
-      }
-    }
-
-    return filters;
-  }
-
-  async postConvertHook(): Promise<void> {
-    this.log('Running SNS post-conversion hook...', 'debug');
-    
-    // Post-process resources to format policy as heredoc
-    for (const resource of this.resources) {
-      if (resource.type === 'aws_sns_topic' && resource.attributes.policy) {
-        const policy = this.escapeAwsInterpolation(resource.attributes.policy);
-        resource.attributes.policy = `<<POLICY
-${policy}
-POLICY`;
-      }
-    }
-  }
-
-  private escapeAwsInterpolation(policy: string): string {
-    return policy.replace(/\$\{/g, '$${');
-  }
 }
-
