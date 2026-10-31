@@ -164,8 +164,8 @@ describe('VPCService', () => {
     ec2.on(DescribeVpcsCommand).resolves({ Vpcs: [{ VpcId: 'vpc-default', IsDefault: true, OwnerId: ACCOUNT }] });
     ec2.on(DescribeInternetGatewaysCommand).resolves({
       InternetGateways: [
-        { InternetGatewayId: 'igw-app', OwnerId: ACCOUNT, Attachments: [{ VpcId: 'vpc-app', State: 'available' }] },
-        { InternetGatewayId: 'igw-default', OwnerId: ACCOUNT, Attachments: [{ VpcId: 'vpc-default', State: 'available' }] }
+        { InternetGatewayId: 'igw-app', OwnerId: ACCOUNT, Attachments: [{ VpcId: 'vpc-app', State: 'attached' }] },
+        { InternetGatewayId: 'igw-default', OwnerId: ACCOUNT, Attachments: [{ VpcId: 'vpc-default', State: 'attached' }] }
       ]
     });
     ec2.on(DescribeEgressOnlyInternetGatewaysCommand).resolves({
@@ -186,10 +186,10 @@ describe('VPCService', () => {
     });
     ec2.on(DescribeVpcEndpointsCommand).resolves({
       VpcEndpoints: [
-        { VpcEndpointId: 'vpce-s3', State: 'available', OwnerId: ACCOUNT, ServiceName: 'com.amazonaws.eu-west-1.s3' },
-        { VpcEndpointId: 'vpce-managed', State: 'available', OwnerId: ACCOUNT, RequesterManaged: true },
+        { VpcEndpointId: 'vpce-s3', State: 'Available', OwnerId: ACCOUNT, ServiceName: 'com.amazonaws.eu-west-1.s3' },
+        { VpcEndpointId: 'vpce-managed', State: 'Available', OwnerId: ACCOUNT, RequesterManaged: true },
         { VpcEndpointId: 'vpce-deleted', State: 'Deleted', OwnerId: ACCOUNT },
-        { VpcEndpointId: 'vpce-rejected', State: 'rejected', OwnerId: ACCOUNT }
+        { VpcEndpointId: 'vpce-rejected', State: 'Rejected', OwnerId: ACCOUNT }
       ]
     });
     ec2.on(DescribeVpcEndpointServiceConfigurationsCommand).resolves({

@@ -28,7 +28,7 @@ export class MSKService extends AwsService {
       for await (const page of paginateListConfigurations({ client: kafka }, {})) {
         for (const configuration of page.Configurations || []) {
           // Skip configurations being deleted (DELETING / DELETE_FAILED).
-          if (!configuration.Arn || configuration.State?.startsWith('DELETE')) {
+          if (!configuration.Arn || configuration.State?.startsWith('DELET')) {
             continue;
           }
           this.add('aws_msk_configuration', configuration.Arn, configuration.Name || configuration.Arn, {
